@@ -101,14 +101,44 @@ func addFolder(folder string, database *db.DB) error {
 	return nil
 }
 
+// listFolders retrieves and displays all stored folders from the database.
+func listFolders(database *db.DB) error {
+	rows, err := database.Query("SELECT path FROM folders ORDER BY path")
+	if err != nil {
+		return fmt.Errorf("failed to query folders: %w", err)
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return fmt.Errorf("failed to read folder: %w", err)
+		}
+		fmt.Println(path)
+		count++
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error reading folders: %w", err)
+	}
+
+	if count == 0 {
+		fmt.Println("No folders stored")
+	}
+
+	return nil
+}
+
 // main parses subcommands and dispatches to the appropriate handler.
-// Supported commands: addfolder, serve
+// Supported commands: addfolder, listfolders, serve
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  %s <command> [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Commands:\n")
 		fmt.Fprintf(os.Stderr, "  addfolder	Add a folder to Q2\n")
+		fmt.Fprintf(os.Stderr, "  listfolders	List stored folders\n")
 		fmt.Fprintf(os.Stderr, "  serve		Start serving Q2\n")
 	}
 
@@ -150,6 +180,19 @@ func main() {
 
 		if err := addFolder(folder, database); err != nil {
 			fmt.Fprintln(os.Stderr, "Error adding folder:", err)
+			os.Exit(1)
+		}
+
+	case "listfolders":
+		database, err := initDB(q2Dir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error initializing database:", err)
+			os.Exit(1)
+		}
+		defer database.Close()
+
+		if err := listFolders(database); err != nil {
+			fmt.Fprintln(os.Stderr, "Error listing folders:", err)
 			os.Exit(1)
 		}
 

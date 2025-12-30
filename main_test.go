@@ -401,3 +401,44 @@ func TestInitDB_MigrationsApplied(t *testing.T) {
 		t.Error("Expected case_sensitivity migration to be applied")
 	}
 }
+
+func TestListFolders_Empty(t *testing.T) {
+	database, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	err := listFolders(database)
+	if err != nil {
+		t.Fatalf("listFolders failed: %v", err)
+	}
+}
+
+func TestListFolders_WithFolders(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Add some folders
+	parent := filepath.Dir(testFolder)
+	folders := []string{
+		createTestFolder(t, parent, "aaa"),
+		createTestFolder(t, parent, "bbb"),
+		createTestFolder(t, parent, "ccc"),
+	}
+
+	for _, folder := range folders {
+		if err := addFolder(folder, database); err != nil {
+			t.Fatalf("addFolder failed: %v", err)
+		}
+	}
+
+	// listFolders should not error
+	err := listFolders(database)
+	if err != nil {
+		t.Fatalf("listFolders failed: %v", err)
+	}
+
+	// Verify folders are in database
+	storedFolders := getFolders(t, database)
+	if len(storedFolders) != 3 {
+		t.Errorf("Expected 3 folders, got %d", len(storedFolders))
+	}
+}
