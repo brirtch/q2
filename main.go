@@ -20,11 +20,12 @@ func homeEndpoint(w http.ResponseWriter, req *http.Request) {
 // It creates the file if it doesn't exist and ensures no duplicate entries
 // (case-insensitive). Returns an error if the folder is empty or an I/O error occurs.
 func addFolder(folder string, baseDir string) error {
+	folder = strings.TrimSpace(folder)
 	if folder == "" {
 		return errors.New("folder cannot be empty")
 	}
 
-	folder = filepath.Clean(strings.TrimSpace(folder))
+	folder = filepath.Clean(folder)
 
 	q2Dir := ".q2"
 	filePath := filepath.Join(baseDir, "folders.txt")
@@ -42,7 +43,7 @@ func addFolder(folder string, baseDir string) error {
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line != "" {
-				existing[strings.ToLower(line)] = struct{}{}
+				existing[strings.ToLower(filepath.Clean(line))] = struct{}{}
 			}
 		}
 		file.Close()
