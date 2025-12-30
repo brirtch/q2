@@ -48,8 +48,12 @@ func initDB(baseDir string) (*db.DB, error) {
 // normalizePath cleans the path and applies platform-specific normalization.
 // On Windows, paths are lowercased for case-insensitive comparison.
 // On Linux/macOS, paths are kept as-is for case-sensitive comparison.
+// Also strips stray quote characters that can result from shell escaping issues.
 func normalizePath(path string) string {
-	path = filepath.Clean(strings.TrimSpace(path))
+	path = strings.TrimSpace(path)
+	// Remove stray quotes from shell escaping issues (e.g., "path\" becomes path")
+	path = strings.Trim(path, `"'`)
+	path = filepath.Clean(path)
 	if runtime.GOOS == "windows" {
 		path = strings.ToLower(path)
 	}
@@ -62,6 +66,8 @@ func normalizePath(path string) string {
 // Returns an error if the folder is empty, doesn't exist, or a database error occurs.
 func addFolder(folder string, database *db.DB) error {
 	folder = strings.TrimSpace(folder)
+	// Remove stray quotes from shell escaping issues (e.g., "path\" becomes path")
+	folder = strings.Trim(folder, `"'`)
 	if folder == "" {
 		return errors.New("folder cannot be empty")
 	}
@@ -105,6 +111,8 @@ func addFolder(folder string, database *db.DB) error {
 // Returns an error if the folder is empty or not found.
 func removeFolder(folder string, database *db.DB) error {
 	folder = strings.TrimSpace(folder)
+	// Remove stray quotes from shell escaping issues
+	folder = strings.Trim(folder, `"'`)
 	if folder == "" {
 		return errors.New("folder cannot be empty")
 	}
