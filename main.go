@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"jukel.org/q2/db"
@@ -44,9 +45,21 @@ func initDB(baseDir string) (*db.DB, error) {
 	return database, nil
 }
 
+// normalizePath cleans the path and applies platform-specific normalization.
+// On Windows, paths are lowercased for case-insensitive comparison.
+// On Linux/macOS, paths are kept as-is for case-sensitive comparison.
+func normalizePath(path string) string {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
 // addFolder adds the given folder path to the database.
-// It ensures no duplicate entries (case-insensitive due to COLLATE NOCASE on the column).
-// Returns an error if the folder is empty or a database error occurs.
+// It ensures the folder exists and no duplicate entries are added.
+// Case sensitivity matches the platform (case-insensitive on Windows, case-sensitive on Linux).
+// Returns an error if the folder is empty, doesn't exist, or a database error occurs.
 func addFolder(folder string, database *db.DB) error {
 	folder = strings.TrimSpace(folder)
 	if folder == "" {
@@ -55,10 +68,25 @@ func addFolder(folder string, database *db.DB) error {
 
 	folder = filepath.Clean(folder)
 
+	// Check if folder exists
+	info, err := os.Stat(folder)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("folder does not exist: %s", folder)
+		}
+		return fmt.Errorf("cannot access folder: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", folder)
+	}
+
+	// Normalize path for storage (lowercase on Windows)
+	normalizedPath := normalizePath(folder)
+
 	// Try to insert - will fail if duplicate due to UNIQUE constraint
 	result := database.Write(
 		"INSERT OR IGNORE INTO folders (path) VALUES (?)",
-		folder,
+		normalizedPath,
 	)
 	if result.Err != nil {
 		return result.Err

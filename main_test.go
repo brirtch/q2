@@ -11,14 +11,22 @@ import (
 	_ "jukel.org/q2/migrations"
 )
 
-// setupTestDB creates a temporary database for testing.
-func setupTestDB(t *testing.T) (*db.DB, func()) {
+// setupTestEnv creates a temporary directory structure for testing.
+// Returns the database, a test folder path, and a cleanup function.
+func setupTestEnv(t *testing.T) (*db.DB, string, func()) {
 	tmpDir, err := os.MkdirTemp("", "q2-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	dbPath := filepath.Join(tmpDir, "test.db")
+	// Create database in a subdirectory
+	dbDir := filepath.Join(tmpDir, "db")
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		os.RemoveAll(tmpDir)
+		t.Fatalf("Failed to create db dir: %v", err)
+	}
+
+	dbPath := filepath.Join(dbDir, "test.db")
 	database, err := db.Open(dbPath)
 	if err != nil {
 		os.RemoveAll(tmpDir)
@@ -31,12 +39,29 @@ func setupTestDB(t *testing.T) (*db.DB, func()) {
 		t.Fatalf("Failed to run migrations: %v", err)
 	}
 
+	// Create a test folder that can be added
+	testFolder := filepath.Join(tmpDir, "testfolder")
+	if err := os.MkdirAll(testFolder, 0755); err != nil {
+		database.Close()
+		os.RemoveAll(tmpDir)
+		t.Fatalf("Failed to create test folder: %v", err)
+	}
+
 	cleanup := func() {
 		database.Close()
 		os.RemoveAll(tmpDir)
 	}
 
-	return database, cleanup
+	return database, testFolder, cleanup
+}
+
+// createTestFolder creates a subfolder in the given parent directory.
+func createTestFolder(t *testing.T, parent, name string) string {
+	folder := filepath.Join(parent, name)
+	if err := os.MkdirAll(folder, 0755); err != nil {
+		t.Fatalf("Failed to create folder %s: %v", folder, err)
+	}
+	return folder
 }
 
 // getFolders retrieves all folders from the database.
@@ -59,11 +84,10 @@ func getFolders(t *testing.T, database *db.DB) []string {
 }
 
 func TestAddFolder_Basic(t *testing.T) {
-	database, cleanup := setupTestDB(t)
+	database, testFolder, cleanup := setupTestEnv(t)
 	defer cleanup()
 
-	folder := `c:\test`
-	err := addFolder(folder, database)
+	err := addFolder(testFolder, database)
 	if err != nil {
 		t.Fatalf("addFolder failed: %v", err)
 	}
@@ -72,13 +96,15 @@ func TestAddFolder_Basic(t *testing.T) {
 	if len(folders) != 1 {
 		t.Fatalf("Expected 1 folder, got %d", len(folders))
 	}
-	if folders[0] != filepath.Clean(folder) {
-		t.Errorf("Expected %s, got %s", filepath.Clean(folder), folders[0])
+
+	expected := normalizePath(testFolder)
+	if folders[0] != expected {
+		t.Errorf("Expected %s, got %s", expected, folders[0])
 	}
 }
 
 func TestAddFolder_EmptyFolder(t *testing.T) {
-	database, cleanup := setupTestDB(t)
+	database, _, cleanup := setupTestEnv(t)
 	defer cleanup()
 
 	err := addFolder("", database)
@@ -91,7 +117,7 @@ func TestAddFolder_EmptyFolder(t *testing.T) {
 }
 
 func TestAddFolder_WhitespaceOnly(t *testing.T) {
-	database, cleanup := setupTestDB(t)
+	database, _, cleanup := setupTestEnv(t)
 	defer cleanup()
 
 	err := addFolder("   ", database)
@@ -100,20 +126,50 @@ func TestAddFolder_WhitespaceOnly(t *testing.T) {
 	}
 }
 
-func TestAddFolder_ExactDuplicate(t *testing.T) {
-	database, cleanup := setupTestDB(t)
+func TestAddFolder_NonExistentFolder(t *testing.T) {
+	database, _, cleanup := setupTestEnv(t)
 	defer cleanup()
 
-	folder := `c:\test`
+	err := addFolder("/nonexistent/path/that/does/not/exist", database)
+	if err == nil {
+		t.Fatal("Expected error for non-existent folder, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("Expected 'does not exist' error, got: %v", err)
+	}
+}
+
+func TestAddFolder_FileNotDirectory(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Create a file instead of a directory
+	filePath := filepath.Join(filepath.Dir(testFolder), "testfile.txt")
+	if err := os.WriteFile(filePath, []byte("test"), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	err := addFolder(filePath, database)
+	if err == nil {
+		t.Fatal("Expected error for file path, got nil")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("Expected 'not a directory' error, got: %v", err)
+	}
+}
+
+func TestAddFolder_ExactDuplicate(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
 
 	// Add first time
-	err := addFolder(folder, database)
+	err := addFolder(testFolder, database)
 	if err != nil {
 		t.Fatalf("First addFolder failed: %v", err)
 	}
 
 	// Add second time (duplicate)
-	err = addFolder(folder, database)
+	err = addFolder(testFolder, database)
 	if err != nil {
 		t.Fatalf("Second addFolder failed: %v", err)
 	}
@@ -125,69 +181,56 @@ func TestAddFolder_ExactDuplicate(t *testing.T) {
 	}
 }
 
-func TestAddFolder_CaseInsensitiveDuplicate(t *testing.T) {
-	database, cleanup := setupTestDB(t)
+func TestAddFolder_CaseHandlingOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Skipping Windows case test on non-Windows platform")
+	}
+
+	database, testFolder, cleanup := setupTestEnv(t)
 	defer cleanup()
 
-	// Add first time with lowercase
-	err := addFolder(`c:\test`, database)
+	// Add with original case
+	err := addFolder(testFolder, database)
 	if err != nil {
 		t.Fatalf("First addFolder failed: %v", err)
 	}
 
-	// Add second time with uppercase (should be detected as duplicate due to COLLATE NOCASE)
-	err = addFolder(`C:\TEST`, database)
+	// Add with different case (should be detected as duplicate on Windows)
+	upperFolder := strings.ToUpper(testFolder)
+	err = addFolder(upperFolder, database)
 	if err != nil {
 		t.Fatalf("Second addFolder failed: %v", err)
 	}
 
-	// Should still only have 1 entry
+	// Should still only have 1 entry (case-insensitive on Windows)
 	folders := getFolders(t, database)
 	if len(folders) != 1 {
 		t.Fatalf("Expected 1 folder after case-insensitive duplicate, got %d", len(folders))
 	}
+
+	// Path should be stored as lowercase
+	if folders[0] != strings.ToLower(testFolder) {
+		t.Errorf("Expected lowercase path %s, got %s", strings.ToLower(testFolder), folders[0])
+	}
 }
 
 func TestAddFolder_TrailingSlashDuplicate(t *testing.T) {
-	database, cleanup := setupTestDB(t)
+	database, testFolder, cleanup := setupTestEnv(t)
 	defer cleanup()
 
-	// Add first time with trailing backslash
-	err := addFolder(`c:\test\`, database)
+	// Add first time with trailing separator
+	err := addFolder(testFolder+string(filepath.Separator), database)
 	if err != nil {
 		t.Fatalf("First addFolder failed: %v", err)
 	}
 
-	// Add second time without trailing backslash (should be detected as duplicate after Clean)
-	err = addFolder(`c:\test`, database)
+	// Add second time without trailing separator
+	err = addFolder(testFolder, database)
 	if err != nil {
 		t.Fatalf("Second addFolder failed: %v", err)
 	}
 
-	// Should still only have 1 entry
-	folders := getFolders(t, database)
-	if len(folders) != 1 {
-		t.Fatalf("Expected 1 folder after trailing slash duplicate, got %d: %v", len(folders), folders)
-	}
-}
-
-func TestAddFolder_ReverseTrailingSlashDuplicate(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	// Add first time without trailing backslash
-	err := addFolder(`c:\test`, database)
-	if err != nil {
-		t.Fatalf("First addFolder failed: %v", err)
-	}
-
-	// Add second time with trailing backslash (should be detected as duplicate after Clean)
-	err = addFolder(`c:\test\`, database)
-	if err != nil {
-		t.Fatalf("Second addFolder failed: %v", err)
-	}
-
-	// Should still only have 1 entry
+	// Should still only have 1 entry (filepath.Clean normalizes)
 	folders := getFolders(t, database)
 	if len(folders) != 1 {
 		t.Fatalf("Expected 1 folder after trailing slash duplicate, got %d: %v", len(folders), folders)
@@ -195,12 +238,17 @@ func TestAddFolder_ReverseTrailingSlashDuplicate(t *testing.T) {
 }
 
 func TestAddFolder_MultipleDifferentFolders(t *testing.T) {
-	database, cleanup := setupTestDB(t)
+	database, testFolder, cleanup := setupTestEnv(t)
 	defer cleanup()
 
-	inputFolders := []string{`c:\test1`, `c:\test2`, `c:\test3`}
+	parent := filepath.Dir(testFolder)
+	folders := []string{
+		createTestFolder(t, parent, "folder1"),
+		createTestFolder(t, parent, "folder2"),
+		createTestFolder(t, parent, "folder3"),
+	}
 
-	for _, folder := range inputFolders {
+	for _, folder := range folders {
 		err := addFolder(folder, database)
 		if err != nil {
 			t.Fatalf("addFolder failed for %s: %v", folder, err)
@@ -208,17 +256,17 @@ func TestAddFolder_MultipleDifferentFolders(t *testing.T) {
 	}
 
 	savedFolders := getFolders(t, database)
-	if len(savedFolders) != len(inputFolders) {
-		t.Fatalf("Expected %d folders, got %d", len(inputFolders), len(savedFolders))
+	if len(savedFolders) != len(folders) {
+		t.Fatalf("Expected %d folders, got %d", len(folders), len(savedFolders))
 	}
 }
 
 func TestAddFolder_WhitespaceHandling(t *testing.T) {
-	database, cleanup := setupTestDB(t)
+	database, testFolder, cleanup := setupTestEnv(t)
 	defer cleanup()
 
 	// Add folder with leading/trailing whitespace
-	err := addFolder("  c:\\test  ", database)
+	err := addFolder("  "+testFolder+"  ", database)
 	if err != nil {
 		t.Fatalf("addFolder failed: %v", err)
 	}
@@ -229,60 +277,51 @@ func TestAddFolder_WhitespaceHandling(t *testing.T) {
 	}
 
 	// Should be cleaned (no whitespace)
-	if folders[0] != `c:\test` {
-		t.Errorf("Expected c:\\test, got %s", folders[0])
+	expected := normalizePath(testFolder)
+	if folders[0] != expected {
+		t.Errorf("Expected %s, got %s", expected, folders[0])
 	}
 }
 
-func TestAddFolder_LinuxPaths(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Skipping Linux path test on Windows")
+func TestNormalizePath(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"cleans path", "foo//bar", filepath.Clean("foo//bar")},
+		{"trims whitespace", "  foo  ", "foo"},
+		{"handles trailing slash", "foo/", "foo"},
 	}
 
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	folder := `/home/user/test`
-	err := addFolder(folder, database)
-	if err != nil {
-		t.Fatalf("addFolder failed: %v", err)
-	}
-
-	folders := getFolders(t, database)
-	if len(folders) != 1 {
-		t.Fatalf("Expected 1 folder, got %d", len(folders))
-	}
-	if folders[0] != folder {
-		t.Errorf("Expected %s, got %s", folder, folders[0])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := normalizePath(tt.input)
+			expected := tt.expected
+			if runtime.GOOS == "windows" {
+				expected = strings.ToLower(expected)
+			}
+			if result != expected {
+				t.Errorf("normalizePath(%q) = %q, expected %q", tt.input, result, expected)
+			}
+		})
 	}
 }
 
-func TestAddFolder_CaseSensitivityOnLinux(t *testing.T) {
+func TestNormalizePath_CaseSensitivity(t *testing.T) {
+	input := "Foo/Bar"
+
+	result := normalizePath(input)
+
 	if runtime.GOOS == "windows" {
-		t.Skip("Skipping case sensitivity test on Windows")
-	}
-
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	// On Linux with COLLATE NOCASE, these are still treated as duplicates
-	// This test documents current behavior - may need to change if we
-	// implement platform-specific case handling
-	err := addFolder(`/home/Test`, database)
-	if err != nil {
-		t.Fatalf("First addFolder failed: %v", err)
-	}
-
-	err = addFolder(`/home/test`, database)
-	if err != nil {
-		t.Fatalf("Second addFolder failed: %v", err)
-	}
-
-	folders := getFolders(t, database)
-	// Current behavior: COLLATE NOCASE treats them as same
-	// Note: This may not be desired behavior on Linux
-	if len(folders) != 1 {
-		t.Logf("Note: %d folders stored - case sensitivity behavior may need review for Linux", len(folders))
+		if result != "foo\\bar" {
+			t.Errorf("On Windows, expected lowercase 'foo\\bar', got %q", result)
+		}
+	} else {
+		expected := filepath.Clean(input)
+		if result != expected {
+			t.Errorf("On Linux/macOS, expected %q, got %q", expected, result)
+		}
 	}
 }
 
@@ -320,7 +359,7 @@ func TestInitDB(t *testing.T) {
 	}
 }
 
-func TestInitDB_MigrationsTable(t *testing.T) {
+func TestInitDB_MigrationsApplied(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "q2-migrations-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -339,14 +378,26 @@ func TestInitDB_MigrationsTable(t *testing.T) {
 		t.Fatalf("GetAppliedMigrations failed: %v", err)
 	}
 
-	found := false
+	// Should have both migrations applied
+	if len(applied) < 2 {
+		t.Errorf("Expected at least 2 migrations applied, got %d: %v", len(applied), applied)
+	}
+
+	// Check for specific migrations
+	hasCreate := false
+	hasCaseFix := false
 	for _, id := range applied {
-		if strings.Contains(id, "folders") {
-			found = true
-			break
+		if strings.Contains(id, "create_folders") {
+			hasCreate = true
+		}
+		if strings.Contains(id, "case_sensitivity") {
+			hasCaseFix = true
 		}
 	}
-	if !found {
-		t.Error("Expected folders migration to be applied")
+	if !hasCreate {
+		t.Error("Expected create_folders migration to be applied")
+	}
+	if !hasCaseFix {
+		t.Error("Expected case_sensitivity migration to be applied")
 	}
 }
