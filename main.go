@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,6 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"jukel.org/q2/db"
+	_ "jukel.org/q2/migrations"
+)
+
+const (
+	q2Dir  = ".q2"
+	dbFile = "q2.db"
 )
 
 // homeEndpoint responds with a simple "Q2" message.
@@ -16,10 +23,31 @@ func homeEndpoint(w http.ResponseWriter, req *http.Request) {
 	fmt.Fprintf(w, "Q2")
 }
 
-// addFolder adds the given folder path to .q2/folders.txt.
-// It creates the file if it doesn't exist and ensures no duplicate entries
-// (case-insensitive). Returns an error if the folder is empty or an I/O error occurs.
-func addFolder(folder string, baseDir string) error {
+// initDB initializes the database and runs migrations.
+func initDB(baseDir string) (*db.DB, error) {
+	// Ensure .q2 directory exists
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory %s: %w", baseDir, err)
+	}
+
+	dbPath := filepath.Join(baseDir, dbFile)
+	database, err := db.Open(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	if err := database.Migrate(); err != nil {
+		database.Close()
+		return nil, fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	return database, nil
+}
+
+// addFolder adds the given folder path to the database.
+// It ensures no duplicate entries (case-insensitive due to COLLATE NOCASE on the column).
+// Returns an error if the folder is empty or a database error occurs.
+func addFolder(folder string, database *db.DB) error {
 	folder = strings.TrimSpace(folder)
 	if folder == "" {
 		return errors.New("folder cannot be empty")
@@ -27,51 +55,22 @@ func addFolder(folder string, baseDir string) error {
 
 	folder = filepath.Clean(folder)
 
-	q2Dir := ".q2"
-	filePath := filepath.Join(baseDir, "folders.txt")
-
-	// Ensure .q2 directory exists
-	if err := os.MkdirAll(q2Dir, 0755); err != nil {
-		return err
+	// Try to insert - will fail if duplicate due to UNIQUE constraint
+	result := database.Write(
+		"INSERT OR IGNORE INTO folders (path) VALUES (?)",
+		folder,
+	)
+	if result.Err != nil {
+		return result.Err
 	}
 
-	// Check if file exists and read existing entries
-	existing := make(map[string]struct{})
-
-	if file, err := os.Open(filePath); err == nil {
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line != "" {
-				existing[strings.ToLower(filepath.Clean(line))] = struct{}{}
-			}
-		}
-		file.Close()
-		if err := scanner.Err(); err != nil {
-			return err
-		}
-	} else if !os.IsNotExist(err) {
-		return err
+	if result.RowsAffected == 0 {
+		fmt.Printf("Folder %s already exists\n", folder)
+	} else {
+		fmt.Printf("Folder %s added\n", folder)
 	}
 
-	// Case-insensitive duplicate check
-	if _, found := existing[strings.ToLower(folder)]; found {
-		fmt.Printf("Folder %s already exists in folders.txt\n", folder)
-		return nil // already present, do nothing
-	}
-
-	// Append folder
-	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = f.WriteString(folder + "\n")
-	if err == nil {
-		fmt.Printf("Folder %s added to folders.txt\n", folder)
-	}
-	return err
+	return nil
 }
 
 // main parses subcommands and dispatches to the appropriate handler.
@@ -114,7 +113,14 @@ func main() {
 
 		folder := args[0]
 
-		if err := addFolder(folder, ".q2"); err != nil {
+		database, err := initDB(q2Dir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error initializing database:", err)
+			os.Exit(1)
+		}
+		defer database.Close()
+
+		if err := addFolder(folder, database); err != nil {
 			fmt.Fprintln(os.Stderr, "Error adding folder:", err)
 			os.Exit(1)
 		}
@@ -132,6 +138,13 @@ func main() {
 			serveCmd.Usage()
 			os.Exit(2)
 		}
+
+		database, err := initDB(q2Dir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error initializing database:", err)
+			os.Exit(1)
+		}
+		defer database.Close()
 
 		fmt.Println("Q2")
 
