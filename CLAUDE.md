@@ -32,32 +32,46 @@ go run main.go serve
 **Run tests:**
 ```bash
 # Run all tests
-go test
+go test ./...
 
 # Run tests with verbose output
-go test -v
+go test -v ./...
 
 # Run a specific test
 go test -v -run TestAddFolder_TrailingSlashDuplicate
+
+# Run only db package tests
+go test -v ./db/...
 ```
 
 ## Architecture
 
-This is a single-file application (main.go) with a simple command-line interface pattern:
+### CLI (main.go)
 
-- **Command parsing**: Uses Go's `flag` package with subcommands
-- **Data storage**: `.q2/folders.txt` stores folder paths (one per line, case-insensitive deduplication)
-- **HTTP server**: Basic server with single endpoint at `/` returning "Q2"
-
-### Key Functions
+Command-line interface using Go's `flag` package with subcommands:
 
 - `main()` (main.go:78): Entry point, dispatches to subcommand handlers
 - `addFolder()` (main.go:22): Handles folder path persistence with case-insensitive duplicate checking
 - `homeEndpoint()` (main.go:15): HTTP handler for root path
 
+### Database (db/)
+
+SQLite wrapper using the **Single Writer Pattern** to eliminate write lock contention:
+
+- All writes are serialized through a single goroutine via a channel
+- Reads use a connection pool for concurrent access
+- WAL mode enabled for concurrent reads during writes
+
+Key types and functions:
+- `db.Open(path)`: Opens database, starts writer goroutine, returns `*DB`
+- `db.Write(query, args...)`: Sends write to writer goroutine, blocks for result
+- `db.WriteContext(ctx, query, args...)`: Write with cancellation support
+- `db.Query/QueryRow`: Read operations using connection pool
+- `db.Close()`: Graceful shutdown, drains pending writes
+
+See `docs/design/sqlite-single-writer.txt` for design details.
+
 ### Data Storage
 
 The `.q2/` directory is gitignored and contains:
 - `folders.txt`: Newline-separated list of folder paths with case-insensitive uniqueness
-
-When modifying folder management logic, ensure the case-insensitive duplicate checking (main.go:56) is preserved.

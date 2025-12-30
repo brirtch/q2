@@ -1,0 +1,69 @@
+## Single Writer Pattern
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Goroutine  │     │  Goroutine  │     │  Goroutine  │
+│   (read)    │     │   (read)    │     │   (write)   │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                   │                   │
+       ▼                   ▼                   ▼
+┌──────────────────────────────┐      ┌──────────────┐
+│     Read Connection Pool     │      │ Write Channel│
+│  (multiple connections OK)   │      └──────┬───────┘
+└──────────────┬───────────────┘             │
+               │                             ▼
+               │                   ┌──────────────────┐
+               │                   │  Writer Goroutine│
+               │                   │  (single writer) │
+               │                   └────────┬─────────┘
+               │                            │
+               ▼                            ▼
+         ┌─────────────────────────────────────┐
+         │         SQLite Database             │
+         │           (WAL mode)                │
+         └─────────────────────────────────────┘
+```
+
+## Key Components
+
+1. **WAL Mode**: Enable Write-Ahead Logging for concurrent reads during writes
+   ```go
+   PRAGMA journal_mode=WAL;
+   ```
+
+2. **Single Writer Goroutine**: All writes go through a channel to one dedicated goroutine - eliminates lock contention entirely
+
+3. **Read Pool**: Multiple connections can read concurrently (WAL allows this)
+
+4. **Request/Response Pattern**: Write requests include a response channel for results/errors
+
+## Basic Structure
+
+```go
+type WriteRequest struct {
+    Query  string
+    Args   []any
+    Result chan WriteResult
+}
+
+type WriteResult struct {
+    LastID int64
+    Err    error
+}
+
+type DB struct {
+    readPool  *sql.DB    // multiple read connections
+    writeConn *sql.DB    // single write connection
+    writeChan chan WriteRequest
+}
+```
+
+## Trade-offs
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Single Writer Channel | No locks, predictable ordering, Go-idiomatic | Write throughput limited to one goroutine |
+| Mutex on writes | Simpler code | Lock contention under load |
+| Separate read/write DBs | Maximum read scaling | Complexity, potential staleness |
+
+The single writer pattern is ideal for most use cases - it's simple, eliminates write locks entirely, and works well for most workloads where writes aren't the bottleneck.
