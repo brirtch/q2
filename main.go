@@ -101,6 +101,29 @@ func addFolder(folder string, database *db.DB) error {
 	return nil
 }
 
+// removeFolder removes a folder from the database.
+// Returns an error if the folder is empty or not found.
+func removeFolder(folder string, database *db.DB) error {
+	folder = strings.TrimSpace(folder)
+	if folder == "" {
+		return errors.New("folder cannot be empty")
+	}
+
+	normalizedPath := normalizePath(folder)
+
+	result := database.Write("DELETE FROM folders WHERE path = ?", normalizedPath)
+	if result.Err != nil {
+		return result.Err
+	}
+
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("folder not found: %s", folder)
+	}
+
+	fmt.Printf("Folder %s removed\n", folder)
+	return nil
+}
+
 // listFolders retrieves and displays all stored folders from the database.
 func listFolders(database *db.DB) error {
 	rows, err := database.Query("SELECT path FROM folders ORDER BY path")
@@ -131,13 +154,14 @@ func listFolders(database *db.DB) error {
 }
 
 // main parses subcommands and dispatches to the appropriate handler.
-// Supported commands: addfolder, listfolders, serve
+// Supported commands: addfolder, removefolder, listfolders, serve
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  %s <command> [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Commands:\n")
 		fmt.Fprintf(os.Stderr, "  addfolder	Add a folder to Q2\n")
+		fmt.Fprintf(os.Stderr, "  removefolder	Remove a folder from Q2\n")
 		fmt.Fprintf(os.Stderr, "  listfolders	List stored folders\n")
 		fmt.Fprintf(os.Stderr, "  serve		Start serving Q2\n")
 	}
@@ -183,6 +207,41 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "removefolder":
+		removeFolderCmd := flag.NewFlagSet("removefolder", flag.ContinueOnError)
+
+		removeFolderCmd.Usage = func() {
+			fmt.Fprintf(os.Stderr, "Usage: \n")
+			fmt.Fprintf(os.Stderr, "  %s removefolder <folder>\n\n", os.Args[0])
+			removeFolderCmd.PrintDefaults()
+		}
+		if err := removeFolderCmd.Parse(os.Args[2:]); err != nil {
+			removeFolderCmd.Usage()
+			os.Exit(2)
+		}
+
+		args := removeFolderCmd.Args()
+
+		if len(args) != 1 {
+			fmt.Fprintln(os.Stderr, "removefolder requires exactly one <folder>")
+			removeFolderCmd.Usage()
+			os.Exit(2)
+		}
+
+		folder := args[0]
+
+		database, err := initDB(q2Dir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error initializing database:", err)
+			os.Exit(1)
+		}
+		defer database.Close()
+
+		if err := removeFolder(folder, database); err != nil {
+			fmt.Fprintln(os.Stderr, "Error removing folder:", err)
+			os.Exit(1)
+		}
+
 	case "listfolders":
 		database, err := initDB(q2Dir)
 		if err != nil {
@@ -198,10 +257,12 @@ func main() {
 
 	case "serve":
 		serveCmd := flag.NewFlagSet("serve", flag.ContinueOnError)
+		port := serveCmd.Int("port", 8090, "Port to listen on")
 
 		serveCmd.Usage = func() {
 			fmt.Fprintf(os.Stderr, "Usage: \n")
-			fmt.Fprintf(os.Stderr, "  %s serve\n\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "  %s serve [options]\n\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "Options:\n")
 			serveCmd.PrintDefaults()
 		}
 
@@ -221,8 +282,9 @@ func main() {
 
 		http.HandleFunc("/", homeEndpoint)
 
-		fmt.Println("Listening on port :8090")
-		if err := http.ListenAndServe(":8090", nil); err != nil {
+		addr := fmt.Sprintf(":%d", *port)
+		fmt.Printf("Listening on port %s\n", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil {
 			fmt.Fprintln(os.Stderr, "Server error:", err)
 			os.Exit(1)
 		}

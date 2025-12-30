@@ -402,6 +402,89 @@ func TestInitDB_MigrationsApplied(t *testing.T) {
 	}
 }
 
+func TestRemoveFolder_Success(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Add a folder first
+	err := addFolder(testFolder, database)
+	if err != nil {
+		t.Fatalf("addFolder failed: %v", err)
+	}
+
+	// Verify it's there
+	folders := getFolders(t, database)
+	if len(folders) != 1 {
+		t.Fatalf("Expected 1 folder, got %d", len(folders))
+	}
+
+	// Remove it
+	err = removeFolder(testFolder, database)
+	if err != nil {
+		t.Fatalf("removeFolder failed: %v", err)
+	}
+
+	// Verify it's gone
+	folders = getFolders(t, database)
+	if len(folders) != 0 {
+		t.Fatalf("Expected 0 folders after removal, got %d", len(folders))
+	}
+}
+
+func TestRemoveFolder_NotFound(t *testing.T) {
+	database, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	err := removeFolder("/nonexistent/folder", database)
+	if err == nil {
+		t.Fatal("Expected error for non-existent folder, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("Expected 'not found' error, got: %v", err)
+	}
+}
+
+func TestRemoveFolder_EmptyFolder(t *testing.T) {
+	database, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	err := removeFolder("", database)
+	if err == nil {
+		t.Fatal("Expected error for empty folder, got nil")
+	}
+	if err.Error() != "folder cannot be empty" {
+		t.Errorf("Expected 'folder cannot be empty' error, got: %v", err)
+	}
+}
+
+func TestRemoveFolder_CaseHandlingOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Skipping Windows case test on non-Windows platform")
+	}
+
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Add with original case
+	err := addFolder(testFolder, database)
+	if err != nil {
+		t.Fatalf("addFolder failed: %v", err)
+	}
+
+	// Remove with different case (should work on Windows)
+	upperFolder := strings.ToUpper(testFolder)
+	err = removeFolder(upperFolder, database)
+	if err != nil {
+		t.Fatalf("removeFolder with different case failed: %v", err)
+	}
+
+	// Verify it's gone
+	folders := getFolders(t, database)
+	if len(folders) != 0 {
+		t.Fatalf("Expected 0 folders after removal, got %d", len(folders))
+	}
+}
+
 func TestListFolders_Empty(t *testing.T) {
 	database, _, cleanup := setupTestEnv(t)
 	defer cleanup()
