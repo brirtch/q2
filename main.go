@@ -45,15 +45,22 @@ func initDB(baseDir string) (*db.DB, error) {
 	return database, nil
 }
 
+// cleanPath trims whitespace and removes stray quote characters from shell escaping issues.
+// Returns the cleaned path and true if non-empty, or empty string and false if empty.
+func cleanPath(path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	path = strings.Trim(path, `"'`)
+	if path == "" {
+		return "", false
+	}
+	return filepath.Clean(path), true
+}
+
 // normalizePath cleans the path and applies platform-specific normalization.
 // On Windows, paths are lowercased for case-insensitive comparison.
 // On Linux/macOS, paths are kept as-is for case-sensitive comparison.
-// Also strips stray quote characters that can result from shell escaping issues.
 func normalizePath(path string) string {
-	path = strings.TrimSpace(path)
-	// Remove stray quotes from shell escaping issues (e.g., "path\" becomes path")
-	path = strings.Trim(path, `"'`)
-	path = filepath.Clean(path)
+	path, _ = cleanPath(path)
 	if runtime.GOOS == "windows" {
 		path = strings.ToLower(path)
 	}
@@ -65,14 +72,10 @@ func normalizePath(path string) string {
 // Case sensitivity matches the platform (case-insensitive on Windows, case-sensitive on Linux).
 // Returns an error if the folder is empty, doesn't exist, or a database error occurs.
 func addFolder(folder string, database *db.DB) error {
-	folder = strings.TrimSpace(folder)
-	// Remove stray quotes from shell escaping issues (e.g., "path\" becomes path")
-	folder = strings.Trim(folder, `"'`)
-	if folder == "" {
+	folder, ok := cleanPath(folder)
+	if !ok {
 		return errors.New("folder cannot be empty")
 	}
-
-	folder = filepath.Clean(folder)
 
 	// Check if folder exists
 	info, err := os.Stat(folder)
@@ -110,10 +113,8 @@ func addFolder(folder string, database *db.DB) error {
 // removeFolder removes a folder from the database.
 // Returns an error if the folder is empty or not found.
 func removeFolder(folder string, database *db.DB) error {
-	folder = strings.TrimSpace(folder)
-	// Remove stray quotes from shell escaping issues
-	folder = strings.Trim(folder, `"'`)
-	if folder == "" {
+	folder, ok := cleanPath(folder)
+	if !ok {
 		return errors.New("folder cannot be empty")
 	}
 
