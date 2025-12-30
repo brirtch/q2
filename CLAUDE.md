@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Q2 is a simple Go CLI application with two main commands:
-- `addfolder`: Manages a list of folder paths in `.q2/folders.txt`
-- `serve`: Runs a basic HTTP server on port 8090
+Q2 is a Go CLI application for managing folder paths with the following commands:
+- `addfolder`: Add a folder to the database (validates folder exists)
+- `removefolder`: Remove a folder from the database
+- `listfolders`: List all stored folders
+- `serve`: Run HTTP server with configurable port
 
 ## Build & Run Commands
 
@@ -17,16 +19,25 @@ go build -o q2.exe .
 
 **Run without building:**
 ```bash
-go run main.go <command>
+go run . <command>
 ```
 
 **Available commands:**
 ```bash
-# Add a folder to the tracked list
-go run main.go addfolder <folder_path>
+# Add a folder (must exist on filesystem)
+go run . addfolder <folder_path>
 
-# Start the HTTP server
-go run main.go serve
+# Remove a folder
+go run . removefolder <folder_path>
+
+# List all stored folders
+go run . listfolders
+
+# Start HTTP server (default port 8090)
+go run . serve
+
+# Start HTTP server on custom port
+go run . serve -port 3000
 ```
 
 **Run tests:**
@@ -38,7 +49,7 @@ go test ./...
 go test -v ./...
 
 # Run a specific test
-go test -v -run TestAddFolder_TrailingSlashDuplicate
+go test -v -run TestAddFolder_Basic
 
 # Run only db package tests
 go test -v ./db/...
@@ -50,9 +61,11 @@ go test -v ./db/...
 
 Command-line interface using Go's `flag` package with subcommands:
 
-- `main()` (main.go:78): Entry point, dispatches to subcommand handlers
-- `addFolder()` (main.go:22): Handles folder path persistence with case-insensitive duplicate checking
-- `homeEndpoint()` (main.go:15): HTTP handler for root path
+- `addFolder()`: Validates folder exists, normalizes path, stores in database
+- `removeFolder()`: Removes folder from database by normalized path
+- `listFolders()`: Queries and displays all stored folders
+- `normalizePath()`: Platform-specific path handling (lowercase on Windows)
+- `homeEndpoint()`: HTTP handler for root path
 
 ### Database (db/)
 
@@ -62,16 +75,29 @@ SQLite wrapper using the **Single Writer Pattern** to eliminate write lock conte
 - Reads use a connection pool for concurrent access
 - WAL mode enabled for concurrent reads during writes
 
-Key types and functions:
-- `db.Open(path)`: Opens database, starts writer goroutine, returns `*DB`
+Key functions:
+- `db.Open(path)`: Opens database, starts writer goroutine
 - `db.Write(query, args...)`: Sends write to writer goroutine, blocks for result
-- `db.WriteContext(ctx, query, args...)`: Write with cancellation support
 - `db.Query/QueryRow`: Read operations using connection pool
+- `db.Migrate()`: Applies pending migrations
 - `db.Close()`: Graceful shutdown, drains pending writes
 
 See `docs/design/sqlite-single-writer.txt` for design details.
 
+### Migrations (migrations/)
+
+Database migrations registered via `init()` functions:
+- `001_create_folders`: Creates folders table
+- `002_fix_case_sensitivity`: Removes COLLATE NOCASE, normalizes paths
+
 ### Data Storage
 
 The `.q2/` directory is gitignored and contains:
-- `folders.txt`: Newline-separated list of folder paths with case-insensitive uniqueness
+- `q2.db`: SQLite database with folders table
+
+### Path Handling
+
+- Paths are normalized with `filepath.Clean()` and trailing quote removal
+- On Windows: paths stored lowercase for case-insensitive matching
+- On Linux: paths stored as-is for case-sensitive matching
+- Duplicate detection uses normalized paths
