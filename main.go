@@ -1,17 +1,24 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
+	"time"
 
 	"jukel.org/q2/db"
 	_ "jukel.org/q2/migrations"
+	"jukel.org/q2/monitor"
+	"jukel.org/q2/scanner"
 )
 
 const (
@@ -172,6 +179,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  addfolder	Add a folder to Q2\n")
 		fmt.Fprintf(os.Stderr, "  removefolder	Remove a folder from Q2\n")
 		fmt.Fprintf(os.Stderr, "  listfolders	List stored folders\n")
+		fmt.Fprintf(os.Stderr, "  scan		Scan a folder for files\n")
 		fmt.Fprintf(os.Stderr, "  serve		Start serving Q2\n")
 	}
 
@@ -264,6 +272,88 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "scan":
+		scanCmd := flag.NewFlagSet("scan", flag.ContinueOnError)
+
+		scanCmd.Usage = func() {
+			fmt.Fprintf(os.Stderr, "Usage: \n")
+			fmt.Fprintf(os.Stderr, "  %s scan <folder>\n\n", os.Args[0])
+			fmt.Fprintf(os.Stderr, "Scans a folder for files and adds them to the database.\n")
+			fmt.Fprintf(os.Stderr, "The folder must be within a monitored folder.\n\n")
+			scanCmd.PrintDefaults()
+		}
+
+		if err := scanCmd.Parse(os.Args[2:]); err != nil {
+			scanCmd.Usage()
+			os.Exit(2)
+		}
+
+		args := scanCmd.Args()
+
+		if len(args) != 1 {
+			fmt.Fprintln(os.Stderr, "scan requires exactly one <folder>")
+			scanCmd.Usage()
+			os.Exit(2)
+		}
+
+		folder := args[0]
+
+		// Clean and validate the folder path
+		folder, ok := cleanPath(folder)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "Error: folder cannot be empty")
+			os.Exit(1)
+		}
+
+		// Check if folder exists
+		info, err := os.Stat(folder)
+		if err != nil {
+			if os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "Error: folder does not exist: %s\n", folder)
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: cannot access folder: %v\n", err)
+			}
+			os.Exit(1)
+		}
+		if !info.IsDir() {
+			fmt.Fprintf(os.Stderr, "Error: path is not a directory: %s\n", folder)
+			os.Exit(1)
+		}
+
+		database, err := initDB(q2Dir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error initializing database:", err)
+			os.Exit(1)
+		}
+		defer database.Close()
+
+		// Find the parent monitored folder
+		parentPath, folderID, err := scanner.FindParentFolder(database, folder)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Scanning %s (monitored folder: %s)...\n", folder, parentPath)
+
+		// Perform the scan
+		result, err := scanner.ScanFolder(database, folder, folderID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error scanning folder: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Report results
+		fmt.Printf("Scan complete: %d added, %d updated, %d removed\n",
+			result.FilesAdded, result.FilesUpdated, result.FilesRemoved)
+
+		if len(result.Errors) > 0 {
+			fmt.Printf("%d errors encountered:\n", len(result.Errors))
+			for _, e := range result.Errors {
+				fmt.Printf("  - %v\n", e)
+			}
+		}
+
 	case "serve":
 		serveCmd := flag.NewFlagSet("serve", flag.ContinueOnError)
 		port := serveCmd.Int("port", 8090, "Port to listen on")
@@ -287,16 +377,67 @@ func main() {
 		}
 		defer database.Close()
 
-		fmt.Println("Q2")
-
-		http.HandleFunc("/", homeEndpoint)
-
-		addr := fmt.Sprintf(":%d", *port)
-		fmt.Printf("Listening on port %s\n", addr)
-		if err := http.ListenAndServe(addr, nil); err != nil {
-			fmt.Fprintln(os.Stderr, "Server error:", err)
+		// Create the monitor (but don't start yet)
+		mon, err := monitor.New(database)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error creating monitor:", err)
 			os.Exit(1)
 		}
+
+		fmt.Println("Q2")
+
+		// Set up HTTP handlers
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", homeEndpoint)
+		mux.HandleFunc("/monitor_status", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			status := mon.Status.GetStatus()
+			if err := json.NewEncoder(w).Encode(status); err != nil {
+				http.Error(w, "Failed to encode status", http.StatusInternalServerError)
+			}
+		})
+
+		addr := fmt.Sprintf(":%d", *port)
+		server := &http.Server{
+			Addr:    addr,
+			Handler: mux,
+		}
+
+		// Handle shutdown signals
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+		// Start server in goroutine
+		go func() {
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				fmt.Fprintln(os.Stderr, "Server error:", err)
+				os.Exit(1)
+			}
+		}()
+
+		fmt.Printf("Listening on port %s\n", addr)
+
+		// Start the monitor after server is listening
+		if err := mon.Start(); err != nil {
+			fmt.Fprintln(os.Stderr, "Error starting monitor:", err)
+			os.Exit(1)
+		}
+
+		// Wait for shutdown signal
+		<-sigChan
+		fmt.Println("\nShutting down...")
+
+		// Stop the monitor first
+		mon.Stop()
+
+		// Shutdown HTTP server with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "Server shutdown error:", err)
+		}
+
+		fmt.Println("Shutdown complete")
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", os.Args[1])
