@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -523,5 +526,485 @@ func TestListFolders_WithFolders(t *testing.T) {
 	storedFolders := getFolders(t, database)
 	if len(storedFolders) != 3 {
 		t.Errorf("Expected 3 folders, got %d", len(storedFolders))
+	}
+}
+
+// Tests for isPathWithinRoots
+
+func TestIsPathWithinRoots_ExactMatch(t *testing.T) {
+	roots := []string{"/home/user/photos", "/home/user/music"}
+	if runtime.GOOS == "windows" {
+		roots = []string{"c:\\users\\user\\photos", "c:\\users\\user\\music"}
+	}
+
+	result := isPathWithinRoots(roots[0], roots)
+	if result == "" {
+		t.Error("Expected root folder to match itself")
+	}
+}
+
+func TestIsPathWithinRoots_Subdirectory(t *testing.T) {
+	var root, subdir string
+	if runtime.GOOS == "windows" {
+		root = "c:\\users\\user\\photos"
+		subdir = "c:\\users\\user\\photos\\2024\\vacation"
+	} else {
+		root = "/home/user/photos"
+		subdir = "/home/user/photos/2024/vacation"
+	}
+	roots := []string{root}
+
+	result := isPathWithinRoots(subdir, roots)
+	if result == "" {
+		t.Errorf("Expected subdirectory %s to be within root %s", subdir, root)
+	}
+}
+
+func TestIsPathWithinRoots_OutsideRoots(t *testing.T) {
+	var roots []string
+	var outsidePath string
+	if runtime.GOOS == "windows" {
+		roots = []string{"c:\\users\\user\\photos"}
+		outsidePath = "c:\\users\\user\\documents"
+	} else {
+		roots = []string{"/home/user/photos"}
+		outsidePath = "/home/user/documents"
+	}
+
+	result := isPathWithinRoots(outsidePath, roots)
+	if result != "" {
+		t.Errorf("Expected path outside roots to not match, but got: %s", result)
+	}
+}
+
+func TestIsPathWithinRoots_SimilarPrefix(t *testing.T) {
+	// Test that /home/user/photos doesn't match /home/user/photos2
+	var roots []string
+	var similarPath string
+	if runtime.GOOS == "windows" {
+		roots = []string{"c:\\users\\user\\photos"}
+		similarPath = "c:\\users\\user\\photos2"
+	} else {
+		roots = []string{"/home/user/photos"}
+		similarPath = "/home/user/photos2"
+	}
+
+	result := isPathWithinRoots(similarPath, roots)
+	if result != "" {
+		t.Errorf("Expected similar prefix path to not match, but got: %s", result)
+	}
+}
+
+func TestIsPathWithinRoots_EmptyRoots(t *testing.T) {
+	result := isPathWithinRoots("/some/path", []string{})
+	if result != "" {
+		t.Error("Expected no match with empty roots")
+	}
+}
+
+// Tests for listDirectory
+
+func TestListDirectory_Basic(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "listdir-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create some test files and directories
+	if err := os.Mkdir(filepath.Join(tmpDir, "subdir"), 0755); err != nil {
+		t.Fatalf("Failed to create subdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("test"), 0644); err != nil {
+		t.Fatalf("Failed to create file: %v", err)
+	}
+
+	entries, err := listDirectory(tmpDir)
+	if err != nil {
+		t.Fatalf("listDirectory failed: %v", err)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("Expected 2 entries, got %d", len(entries))
+	}
+
+	// Check that we have both a file and a dir
+	hasDir := false
+	hasFile := false
+	for _, e := range entries {
+		if e.Name == "subdir" && e.Type == "dir" {
+			hasDir = true
+		}
+		if e.Name == "file.txt" && e.Type == "file" {
+			hasFile = true
+			if e.Size != 4 {
+				t.Errorf("Expected file size 4, got %d", e.Size)
+			}
+		}
+	}
+	if !hasDir {
+		t.Error("Expected to find subdir")
+	}
+	if !hasFile {
+		t.Error("Expected to find file.txt")
+	}
+}
+
+func TestListDirectory_Empty(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "listdir-empty-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	entries, err := listDirectory(tmpDir)
+	if err != nil {
+		t.Fatalf("listDirectory failed: %v", err)
+	}
+
+	if len(entries) != 0 {
+		t.Errorf("Expected 0 entries for empty dir, got %d", len(entries))
+	}
+}
+
+func TestListDirectory_NonExistent(t *testing.T) {
+	_, err := listDirectory("/nonexistent/path/that/does/not/exist")
+	if err == nil {
+		t.Error("Expected error for non-existent directory")
+	}
+}
+
+func TestListDirectory_HiddenFiles(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "listdir-hidden-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a hidden file (starts with dot)
+	if err := os.WriteFile(filepath.Join(tmpDir, ".hidden"), []byte("secret"), 0644); err != nil {
+		t.Fatalf("Failed to create hidden file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "visible.txt"), []byte("visible"), 0644); err != nil {
+		t.Fatalf("Failed to create visible file: %v", err)
+	}
+
+	entries, err := listDirectory(tmpDir)
+	if err != nil {
+		t.Fatalf("listDirectory failed: %v", err)
+	}
+
+	// Should include hidden files
+	if len(entries) != 2 {
+		t.Fatalf("Expected 2 entries (including hidden), got %d", len(entries))
+	}
+
+	hasHidden := false
+	for _, e := range entries {
+		if e.Name == ".hidden" {
+			hasHidden = true
+		}
+	}
+	if !hasHidden {
+		t.Error("Expected hidden file to be included")
+	}
+}
+
+// Tests for /api/roots handler
+
+func TestRootsHandler_Empty(t *testing.T) {
+	database, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	handler := makeRootsHandler(database)
+	req := httptest.NewRequest(http.MethodGet, "/api/roots", nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", w.Code)
+	}
+
+	var resp RootsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if len(resp.Roots) != 0 {
+		t.Errorf("Expected 0 roots, got %d", len(resp.Roots))
+	}
+}
+
+func TestRootsHandler_WithFolders(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Add some folders
+	parent := filepath.Dir(testFolder)
+	folder1 := createTestFolder(t, parent, "photos")
+	folder2 := createTestFolder(t, parent, "music")
+
+	if err := addFolder(folder1, database); err != nil {
+		t.Fatalf("addFolder failed: %v", err)
+	}
+	if err := addFolder(folder2, database); err != nil {
+		t.Fatalf("addFolder failed: %v", err)
+	}
+
+	handler := makeRootsHandler(database)
+	req := httptest.NewRequest(http.MethodGet, "/api/roots", nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", w.Code)
+	}
+
+	var resp RootsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if len(resp.Roots) != 2 {
+		t.Errorf("Expected 2 roots, got %d", len(resp.Roots))
+	}
+
+	// Check that names are set correctly
+	for _, root := range resp.Roots {
+		if root.Name == "" {
+			t.Error("Expected root name to be set")
+		}
+		if root.Path == "" {
+			t.Error("Expected root path to be set")
+		}
+	}
+}
+
+func TestRootsHandler_MethodNotAllowed(t *testing.T) {
+	database, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	handler := makeRootsHandler(database)
+	req := httptest.NewRequest(http.MethodPost, "/api/roots", nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("Expected status 405, got %d", w.Code)
+	}
+}
+
+// Tests for /api/browse handler
+
+func TestBrowseHandler_ValidPath(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Add the test folder as a monitored folder
+	if err := addFolder(testFolder, database); err != nil {
+		t.Fatalf("addFolder failed: %v", err)
+	}
+
+	// Create some content in the folder
+	subdir := filepath.Join(testFolder, "subdir")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatalf("Failed to create subdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(testFolder, "file.txt"), []byte("test"), 0644); err != nil {
+		t.Fatalf("Failed to create file: %v", err)
+	}
+
+	handler := makeBrowseHandler(database)
+	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+testFolder, nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp BrowseResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if len(resp.Entries) != 2 {
+		t.Errorf("Expected 2 entries, got %d", len(resp.Entries))
+	}
+
+	// Parent should be nil for root folder
+	if resp.Parent != nil {
+		t.Errorf("Expected parent to be nil for root folder, got %v", *resp.Parent)
+	}
+}
+
+func TestBrowseHandler_Subdirectory(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Add the test folder as a monitored folder
+	if err := addFolder(testFolder, database); err != nil {
+		t.Fatalf("addFolder failed: %v", err)
+	}
+
+	// Create a subdirectory
+	subdir := filepath.Join(testFolder, "subdir")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatalf("Failed to create subdir: %v", err)
+	}
+
+	handler := makeBrowseHandler(database)
+	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+subdir, nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp BrowseResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	// Parent should be set for subdirectory
+	if resp.Parent == nil {
+		t.Error("Expected parent to be set for subdirectory")
+	} else if *resp.Parent != testFolder {
+		t.Errorf("Expected parent to be %s, got %s", testFolder, *resp.Parent)
+	}
+}
+
+func TestBrowseHandler_PathOutsideRoots(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Add a folder
+	if err := addFolder(testFolder, database); err != nil {
+		t.Fatalf("addFolder failed: %v", err)
+	}
+
+	// Try to browse a path outside monitored folders
+	outsidePath := filepath.Dir(filepath.Dir(testFolder))
+
+	handler := makeBrowseHandler(database)
+	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+outsidePath, nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("Expected status 403, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if !strings.Contains(resp.Error, "not within monitored") {
+		t.Errorf("Expected 'not within monitored' error, got: %s", resp.Error)
+	}
+}
+
+func TestBrowseHandler_NonExistentPath(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Add a folder
+	if err := addFolder(testFolder, database); err != nil {
+		t.Fatalf("addFolder failed: %v", err)
+	}
+
+	// Try to browse a non-existent path within the monitored folder
+	nonExistent := filepath.Join(testFolder, "does-not-exist")
+
+	handler := makeBrowseHandler(database)
+	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+nonExistent, nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("Expected status 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestBrowseHandler_FileNotDirectory(t *testing.T) {
+	database, testFolder, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	// Add a folder
+	if err := addFolder(testFolder, database); err != nil {
+		t.Fatalf("addFolder failed: %v", err)
+	}
+
+	// Create a file and try to browse it
+	filePath := filepath.Join(testFolder, "file.txt")
+	if err := os.WriteFile(filePath, []byte("test"), 0644); err != nil {
+		t.Fatalf("Failed to create file: %v", err)
+	}
+
+	handler := makeBrowseHandler(database)
+	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+filePath, nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if !strings.Contains(resp.Error, "not a directory") {
+		t.Errorf("Expected 'not a directory' error, got: %s", resp.Error)
+	}
+}
+
+func TestBrowseHandler_MissingPath(t *testing.T) {
+	database, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	handler := makeBrowseHandler(database)
+	req := httptest.NewRequest(http.MethodGet, "/api/browse", nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if !strings.Contains(resp.Error, "path parameter required") {
+		t.Errorf("Expected 'path parameter required' error, got: %s", resp.Error)
+	}
+}
+
+func TestBrowseHandler_MethodNotAllowed(t *testing.T) {
+	database, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	handler := makeBrowseHandler(database)
+	req := httptest.NewRequest(http.MethodPost, "/api/browse?path=/some/path", nil)
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("Expected status 405, got %d", w.Code)
 	}
 }
