@@ -272,6 +272,15 @@ func isVideoFile(path string) bool {
 // Supports Range requests for seeking.
 func makeStreamHandler(database *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Handle CORS preflight for Chromecast
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Range")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
 			return
@@ -335,8 +344,10 @@ func makeStreamHandler(database *db.DB) http.HandlerFunc {
 		}
 		defer file.Close()
 
-		// Set content type header
+		// Set content type and CORS headers (needed for Chromecast)
 		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
 
 		// Use http.ServeContent for Range request support
 		http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
@@ -421,6 +432,15 @@ func makeImageHandler(database *db.DB) http.HandlerFunc {
 // Supports Range requests for seeking.
 func makeVideoHandler(database *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Handle CORS preflight for Chromecast
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Range")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
 			return
@@ -478,7 +498,11 @@ func makeVideoHandler(database *db.DB) http.HandlerFunc {
 		}
 		defer file.Close()
 
+		// Set content type and CORS headers (needed for Chromecast)
 		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
+
 		http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
 	}
 }
@@ -565,6 +589,14 @@ const browsePageHTML = `<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Q2 File Browser</title>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script>
+        // Cast SDK callback - must be defined before SDK loads
+        window.__castCallbacks = [];
+        window['__onGCastApiAvailable'] = function(isAvailable) {
+            window.__castAvailable = isAvailable;
+            window.__castCallbacks.forEach(cb => cb(isAvailable));
+        };
+    </script>
     <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
     <style>
         * { box-sizing: border-box; }
@@ -704,6 +736,11 @@ const browsePageHTML = `<!DOCTYPE html>
         .video-time { font-size: 13px; color: #8b949e; min-width: 100px; text-align: center; }
         .file-name.video-file { color: #f0883e; cursor: pointer; }
         .file-name.video-file:hover { text-decoration: underline; }
+        .video-btn.casting { color: #58a6ff; }
+        .video-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+        .video-casting-indicator { display: flex; align-items: center; justify-content: center; gap: 15px; padding: 10px 20px; background: #1f6feb33; border-top: 1px solid #1f6feb; color: #58a6ff; font-size: 14px; }
+        .stop-casting-btn { background: #30363d; border: 1px solid #484f58; color: #c9d1d9; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+        .stop-casting-btn:hover { background: #484f58; }
     </style>
 </head>
 <body>
@@ -834,15 +871,14 @@ const browsePageHTML = `<!DOCTYPE html>
                         <span class="name">This device</span>
                         <span v-if="!isCasting" class="status">Playing</span>
                     </div>
-                    <div v-if="castDevices.length === 0 && !isCasting" class="cast-searching">
-                        Searching for devices...
-                    </div>
-                    <div v-for="device in castDevices" :key="device.id"
-                         class="cast-device" :class="{ active: castingTo === device.id }"
-                         @click="castTo(device)">
+                    <div v-if="isCasting" class="cast-device active">
                         <span class="icon">📺</span>
-                        <span class="name">{{ device.name }}</span>
-                        <span v-if="castingTo === device.id" class="status">Casting</span>
+                        <span class="name">{{ castingTo }}</span>
+                        <span class="status">Casting</span>
+                    </div>
+                    <div v-if="!isCasting" class="cast-device cast-select" @click="openCastPicker">
+                        <span class="icon">🔍</span>
+                        <span class="name">Cast to a device...</span>
                     </div>
                 </template>
             </div>
@@ -913,6 +949,13 @@ const browsePageHTML = `<!DOCTYPE html>
                 <button class="video-btn" @click="toggleVideoMute" :title="videoMuted ? 'Unmute' : 'Mute'">
                     {{ videoMuted ? '🔇' : '🔊' }}
                 </button>
+                <button class="video-btn" :class="{ casting: isVideoCasting }" @click="openVideoCastPicker" :disabled="!castAvailable" title="Cast">
+                    📺
+                </button>
+            </div>
+            <div v-if="isVideoCasting" class="video-casting-indicator">
+                Casting to {{ videoCastingTo }}
+                <button class="stop-casting-btn" @click="stopVideoCasting">Stop</button>
             </div>
         </div>
 
@@ -953,7 +996,6 @@ const browsePageHTML = `<!DOCTYPE html>
                 // Cast state
                 const showCastPanel = ref(false);
                 const castAvailable = ref(false);
-                const castDevices = ref([]);
                 const isCasting = ref(false);
                 const castingTo = ref(null);
                 let castContext = null;
@@ -961,13 +1003,7 @@ const browsePageHTML = `<!DOCTYPE html>
                 let remotePlayer = null;
                 let remotePlayerController = null;
 
-                // Set up Cast SDK callback - will be called when SDK is ready
-                window['__onGCastApiAvailable'] = function(isAvailable) {
-                    if (isAvailable) {
-                        initCastWhenReady();
-                    }
-                };
-
+                // Register for Cast SDK callback
                 const initCastWhenReady = () => {
                     if (typeof cast === 'undefined' || !cast.framework) {
                         console.log('Cast framework not ready');
@@ -997,8 +1033,16 @@ const browsePageHTML = `<!DOCTYPE html>
                                     castSession = castContext.getCurrentSession();
                                     isCasting.value = true;
                                     castingTo.value = castSession.getCastDevice().friendlyName;
+                                    // Pause local audio immediately
+                                    const localAudio = getActiveAudioElement();
+                                    if (localAudio) {
+                                        localAudio.pause();
+                                    }
+                                    // Load current track on Cast device
                                     if (currentTrack.value) {
                                         castCurrentTrack();
+                                    } else {
+                                        isPlaying.value = false;
                                     }
                                 } else if (event.sessionState === cast.framework.SessionState.SESSION_ENDED) {
                                     castSession = null;
@@ -1050,6 +1094,9 @@ const browsePageHTML = `<!DOCTYPE html>
                 const videoCurrentTime = ref(0);
                 const videoDuration = ref(0);
                 const videoMuted = ref(false);
+                const isVideoCasting = ref(false);
+                const videoCastingTo = ref(null);
+                let videoCastSession = null;
 
                 // Audio elements
                 const audioA = ref(null);
@@ -1255,6 +1302,13 @@ const browsePageHTML = `<!DOCTYPE html>
                 };
 
                 const closeVideo = () => {
+                    // Stop casting if active
+                    if (isVideoCasting.value && videoCastSession) {
+                        videoCastSession.endSession(true);
+                        videoCastSession = null;
+                        isVideoCasting.value = false;
+                        videoCastingTo.value = null;
+                    }
                     if (videoRef.value) {
                         videoRef.value.pause();
                     }
@@ -1301,21 +1355,104 @@ const browsePageHTML = `<!DOCTYPE html>
                     }
                 };
 
+                // Video casting functions
+                const getVideoContentType = (filename) => {
+                    const ext = filename.toLowerCase().split('.').pop();
+                    const types = {
+                        'mp4': 'video/mp4',
+                        'webm': 'video/webm',
+                        'ogv': 'video/ogg',
+                        'mov': 'video/quicktime',
+                        'avi': 'video/x-msvideo',
+                        'mkv': 'video/x-matroska',
+                        'm4v': 'video/mp4'
+                    };
+                    return types[ext] || 'video/mp4';
+                };
+
+                const openVideoCastPicker = async () => {
+                    if (!castAvailable.value || !castContext) return;
+
+                    try {
+                        await castContext.requestSession();
+                        // Session started, now load the video
+                        videoCastSession = castContext.getCurrentSession();
+                        if (videoCastSession && videoFile.value) {
+                            castCurrentVideo();
+                        }
+                    } catch (err) {
+                        if (err.code !== 'cancel') {
+                            console.log('Video cast request failed:', err);
+                        }
+                    }
+                };
+
+                const castCurrentVideo = () => {
+                    if (!videoCastSession || !videoFile.value) return;
+
+                    // Pause local video
+                    if (videoRef.value) {
+                        videoRef.value.pause();
+                    }
+
+                    const videoPath = fullPath(videoFile.value.name);
+                    const streamUrl = window.location.origin + '/api/video?path=' + encodeURIComponent(videoPath);
+                    const contentType = getVideoContentType(videoFile.value.name);
+
+                    console.log('Casting video:', streamUrl, 'as', contentType);
+
+                    const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, contentType);
+                    mediaInfo.metadata = new chrome.cast.media.GenericMediaMetadata();
+                    mediaInfo.metadata.title = videoFile.value.name;
+
+                    const request = new chrome.cast.media.LoadRequest(mediaInfo);
+                    request.autoplay = true;
+                    request.currentTime = videoCurrentTime.value;
+
+                    videoCastSession.loadMedia(request).then(
+                        () => {
+                            console.log('Video loaded on cast device');
+                            isVideoCasting.value = true;
+                            videoCastingTo.value = videoCastSession.getCastDevice().friendlyName;
+                            videoPlaying.value = true;
+                        },
+                        (err) => {
+                            console.error('Failed to load video on cast:', err);
+                            isVideoCasting.value = false;
+                        }
+                    );
+                };
+
+                const stopVideoCasting = () => {
+                    if (videoCastSession) {
+                        videoCastSession.endSession(true);
+                    }
+                    videoCastSession = null;
+                    isVideoCasting.value = false;
+                    videoCastingTo.value = null;
+                    // Resume local playback if video is still open
+                    if (videoRef.value && videoFile.value) {
+                        videoRef.value.play();
+                    }
+                };
+
                 // Cast functions
                 const toggleCastPanel = () => {
                     showCastPanel.value = !showCastPanel.value;
                     showQueue.value = false; // Close queue panel
                 };
 
-                const castTo = async (device) => {
-                    if (!castAvailable.value) return;
+                const openCastPicker = async () => {
+                    if (!castAvailable.value || !castContext) return;
 
                     try {
-                        // Request a cast session - this will show Chrome's cast dialog
+                        // Request a cast session - this opens Chrome's native device picker
                         await castContext.requestSession();
                         showCastPanel.value = false;
                     } catch (err) {
-                        console.log('Cast request cancelled or failed:', err);
+                        if (err.code !== 'cancel') {
+                            console.log('Cast request failed:', err);
+                        }
                     }
                 };
 
@@ -1328,27 +1465,46 @@ const browsePageHTML = `<!DOCTYPE html>
                     showCastPanel.value = false;
                 };
 
+                const getContentType = (filename) => {
+                    const ext = filename.toLowerCase().split('.').pop();
+                    const types = {
+                        'mp3': 'audio/mpeg',
+                        'wav': 'audio/wav',
+                        'flac': 'audio/flac',
+                        'aac': 'audio/aac',
+                        'ogg': 'audio/ogg',
+                        'wma': 'audio/x-ms-wma',
+                        'm4a': 'audio/mp4'
+                    };
+                    return types[ext] || 'audio/mpeg';
+                };
+
                 const castCurrentTrack = () => {
                     if (!castSession || !currentTrack.value) return;
 
-                    const mediaInfo = new chrome.cast.media.MediaInfo(
-                        window.location.origin + '/api/stream?path=' + encodeURIComponent(currentTrack.value.path),
-                        'audio/mpeg'
-                    );
+                    const wasPlaying = isPlaying.value;
+                    const streamUrl = window.location.origin + '/api/stream?path=' + encodeURIComponent(currentTrack.value.path);
+                    const contentType = getContentType(currentTrack.value.name);
+
+                    console.log('Casting:', streamUrl, 'as', contentType);
+
+                    const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, contentType);
                     mediaInfo.metadata = new chrome.cast.media.MusicTrackMediaMetadata();
                     mediaInfo.metadata.title = currentTrack.value.name;
 
                     const request = new chrome.cast.media.LoadRequest(mediaInfo);
-                    request.autoplay = isPlaying.value;
+                    request.autoplay = wasPlaying;
                     request.currentTime = currentTime.value;
 
                     castSession.loadMedia(request).then(
                         () => {
                             console.log('Media loaded on cast device');
-                            // Pause local playback
-                            getActiveAudioElement()?.pause();
+                            isPlaying.value = wasPlaying;
                         },
-                        (err) => console.error('Failed to load media:', err)
+                        (err) => {
+                            console.error('Failed to load media:', err);
+                            isPlaying.value = false;
+                        }
                     );
                 };
 
@@ -1677,8 +1833,15 @@ const browsePageHTML = `<!DOCTYPE html>
                     loadRoots();
                     // Add keyboard listener for image viewer
                     document.addEventListener('keydown', handleKeydown);
-                    // Initialize Google Cast (fallback if SDK already loaded)
-                    initCastWhenReady();
+                    // Initialize Google Cast
+                    // Register callback for when SDK becomes available
+                    window.__castCallbacks.push((isAvailable) => {
+                        if (isAvailable) initCastWhenReady();
+                    });
+                    // Also check if SDK already loaded
+                    if (window.__castAvailable) {
+                        initCastWhenReady();
+                    }
                 });
 
                 return {
@@ -1697,6 +1860,7 @@ const browsePageHTML = `<!DOCTYPE html>
                     videoProgressPercent, formatTime,
                     openVideo, closeVideo, toggleVideoPlay, seekVideo, toggleVideoMute,
                     onVideoTimeUpdate, onVideoMetadata, onVideoPlay, onVideoPause, onVideoEnded,
+                    isVideoCasting, videoCastingTo, openVideoCastPicker, stopVideoCasting,
 
                     // Audio player
                     queue, currentIndex, currentTrack, isPlaying, currentTime, duration,
@@ -1708,8 +1872,8 @@ const browsePageHTML = `<!DOCTYPE html>
                     toggleQueue, removeFromQueue, clearQueue, moveUp, moveDown,
 
                     // Google Cast
-                    showCastPanel, castAvailable, castDevices, isCasting, castingTo,
-                    toggleCastPanel, castTo, stopCasting
+                    showCastPanel, castAvailable, isCasting, castingTo,
+                    toggleCastPanel, openCastPicker, stopCasting
                 };
             }
         }).mount('#app');
