@@ -90,6 +90,15 @@ Database migrations registered via `init()` functions:
 - `001_create_folders`: Creates folders table
 - `002_fix_case_sensitivity`: Removes COLLATE NOCASE, normalizes paths
 
+### HTTP Server (serve command)
+
+Endpoints:
+- `GET /`: Simple health check, returns "Q2"
+- `GET /browse`: File browser HTML page for navigating monitored folders
+- `GET /schema`: Database schema viewer with formatted HTML display
+- `GET /api/roots`: JSON list of monitored root folders
+- `GET /api/browse?path=<path>`: JSON directory listing (path must be within a monitored folder)
+
 ### Data Storage
 
 The `.q2/` directory is gitignored and contains:
