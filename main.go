@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"jukel.org/q2/cast"
 	"jukel.org/q2/db"
 	_ "jukel.org/q2/migrations"
 	"jukel.org/q2/scanner"
@@ -420,8 +421,10 @@ func makeImageHandler(database *db.DB) http.HandlerFunc {
 		}
 		defer file.Close()
 
-		// Set content type header
+		// Set content type and CORS headers (needed for Chromecast)
 		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
 
 		// Use http.ServeContent for caching support
 		http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
@@ -507,6 +510,290 @@ func makeVideoHandler(database *db.DB) http.HandlerFunc {
 	}
 }
 
+// CastPlayRequest is the request body for /api/cast/play.
+type CastPlayRequest struct {
+	Path        string `json:"path"`
+	ContentType string `json:"content_type"`
+	Title       string `json:"title"`
+}
+
+// CastConnectRequest is the request body for /api/cast/connect.
+type CastConnectRequest struct {
+	UUID string `json:"uuid"`
+}
+
+// CastSeekRequest is the request body for /api/cast/seek.
+type CastSeekRequest struct {
+	Position float64 `json:"position"`
+}
+
+// CastVolumeRequest is the request body for /api/cast/volume.
+type CastVolumeRequest struct {
+	Level float64 `json:"level"`
+	Muted *bool   `json:"muted,omitempty"`
+}
+
+// makeCastDevicesHandler creates a handler for /api/cast/devices.
+// Supports ?type=audio to filter for audio-only devices, ?type=video for video devices.
+func makeCastDevicesHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		// Discover devices (5 second timeout)
+		ctx := r.Context()
+		allDevices, err := castMgr.DiscoverDevices(ctx, 5*time.Second)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		// Filter by type if requested
+		deviceType := r.URL.Query().Get("type")
+		var devices []cast.Device
+		for _, d := range allDevices {
+			switch deviceType {
+			case "audio":
+				if d.IsAudio {
+					devices = append(devices, d)
+				}
+			case "video":
+				if !d.IsAudio {
+					devices = append(devices, d)
+				}
+			default:
+				devices = append(devices, d)
+			}
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"devices": devices,
+		})
+	}
+}
+
+// makeCastConnectHandler creates a handler for /api/cast/connect.
+func makeCastConnectHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req CastConnectRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.UUID == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "uuid required"})
+			return
+		}
+
+		if err := castMgr.Connect(req.UUID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"status":  castMgr.GetStatus(),
+		})
+	}
+}
+
+// makeCastDisconnectHandler creates a handler for /api/cast/disconnect.
+func makeCastDisconnectHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		if err := castMgr.Disconnect(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+		})
+	}
+}
+
+// makeCastPlayHandler creates a handler for /api/cast/play.
+func makeCastPlayHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req CastPlayRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.Path == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path required"})
+			return
+		}
+
+		// Auto-detect content type if not provided
+		if req.ContentType == "" {
+			ext := strings.ToLower(filepath.Ext(req.Path))
+			if ct, ok := audioContentTypes[ext]; ok {
+				req.ContentType = ct
+			} else if ct, ok := videoContentTypes[ext]; ok {
+				req.ContentType = ct
+			} else if ct, ok := imageContentTypes[ext]; ok {
+				req.ContentType = ct
+			}
+		}
+
+		mediaURL, err := castMgr.PlayMedia(req.Path, req.ContentType, req.Title)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success":   true,
+			"media_url": mediaURL,
+		})
+	}
+}
+
+// makeCastPauseHandler creates a handler for /api/cast/pause.
+func makeCastPauseHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		if err := castMgr.Pause(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+		})
+	}
+}
+
+// makeCastResumeHandler creates a handler for /api/cast/resume.
+func makeCastResumeHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		if err := castMgr.Resume(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+		})
+	}
+}
+
+// makeCastStopHandler creates a handler for /api/cast/stop.
+func makeCastStopHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		if err := castMgr.Stop(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+		})
+	}
+}
+
+// makeCastSeekHandler creates a handler for /api/cast/seek.
+func makeCastSeekHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req CastSeekRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if err := castMgr.Seek(req.Position); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+		})
+	}
+}
+
+// makeCastVolumeHandler creates a handler for /api/cast/volume.
+func makeCastVolumeHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req CastVolumeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if err := castMgr.SetVolume(req.Level); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		if req.Muted != nil {
+			if err := castMgr.SetMuted(*req.Muted); err != nil {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+				return
+			}
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+		})
+	}
+}
+
+// makeCastStatusHandler creates a handler for /api/cast/status.
+func makeCastStatusHandler(castMgr *cast.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, castMgr.GetStatus())
+	}
+}
+
 // makeBrowseHandler creates a handler for /api/browse.
 func makeBrowseHandler(database *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -589,19 +876,27 @@ const browsePageHTML = `<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Q2 File Browser</title>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <script>
-        // Cast SDK callback - must be defined before SDK loads
-        window.__castCallbacks = [];
-        window['__onGCastApiAvailable'] = function(isAvailable) {
-            window.__castAvailable = isAvailable;
-            window.__castCallbacks.forEach(cb => cb(isAvailable));
-        };
-    </script>
-    <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
     <style>
         * { box-sizing: border-box; }
         body { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", "SF Mono", Consolas, monospace; margin: 0; padding: 20px; padding-bottom: 100px; background: #0d1117; color: #c9d1d9; }
+
+        /* Two-pane layout */
+        .panes-wrapper { display: flex; gap: 20px; }
+        .panes-wrapper.single-pane .pane { flex: 1; }
+        .panes-wrapper.dual-pane .pane { flex: 1; min-width: 0; }
+        .pane { background: #161b22; border-radius: 6px; border: 1px solid #30363d; overflow: hidden; display: flex; flex-direction: column; }
+        .pane-content { flex: 1; overflow-y: auto; max-height: calc(100vh - 250px); }
+        .pane table { width: 100%; }
+
+        /* Header with toggle */
+        .header-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .header-bar h1 { margin: 0; font-size: 22px; color: #58a6ff; }
+        .view-toggle { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+        .view-toggle:hover { background: #30363d; border-color: #484f58; }
+        .view-toggle.active { background: #1f6feb; border-color: #1f6feb; color: white; }
+
         .container { max-width: 1200px; margin: 0 auto; background: #161b22; border-radius: 6px; border: 1px solid #30363d; }
+        .panes-wrapper.dual-pane { max-width: 100%; }
         h1 { margin: 0; padding: 20px; border-bottom: 1px solid #30363d; font-size: 22px; color: #58a6ff; }
         .breadcrumb { padding: 15px 20px; background: #0d1117; border-bottom: 1px solid #30363d; }
         .breadcrumb a { color: #58a6ff; text-decoration: none; cursor: pointer; }
@@ -686,8 +981,11 @@ const browsePageHTML = `<!DOCTYPE html>
         .cast-btn.casting { color: #58a6ff; }
         .cast-panel { position: fixed; bottom: 70px; right: 100px; width: 280px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); z-index: 999; overflow: hidden; }
         .cast-panel.hidden { display: none; }
-        .cast-header { padding: 15px; background: #0d1117; border-bottom: 1px solid #30363d; }
+        .cast-header { padding: 15px; background: #0d1117; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; }
         .cast-header h3 { margin: 0; font-size: 14px; color: #c9d1d9; }
+        .cast-refresh { background: none; border: 1px solid #30363d; color: #58a6ff; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+        .cast-refresh:hover { background: #30363d; }
+        .cast-scanning { font-size: 12px; color: #8b949e; }
         .cast-list { max-height: 300px; overflow-y: auto; }
         .cast-device { display: flex; align-items: center; padding: 12px 15px; border-bottom: 1px solid #21262d; gap: 10px; color: #c9d1d9; cursor: pointer; }
         .cast-device:hover { background: #1f2428; }
@@ -745,79 +1043,167 @@ const browsePageHTML = `<!DOCTYPE html>
 </head>
 <body>
     <div id="app">
-        <div class="container">
+        <!-- Header with toggle -->
+        <div class="header-bar">
             <h1>Q2 File Browser</h1>
+            <button class="view-toggle" :class="{ active: dualPane }" @click="toggleDualPane">
+                {{ dualPane ? '◫ Dual Pane' : '▢ Single Pane' }}
+            </button>
+        </div>
 
-            <!-- Breadcrumb -->
-            <div class="breadcrumb">
-                <a @click="loadRoots">Roots</a>
-                <template v-if="currentPath">
-                    <template v-for="(part, i) in pathParts" :key="i">
-                        <span class="sep">/</span>
-                        <a v-if="i < pathParts.length - 1" @click="browseTo(pathParts.slice(0, i + 1))">{{ part }}</a>
-                        <strong v-else>{{ part }}</strong>
+        <!-- Panes Wrapper -->
+        <div class="panes-wrapper" :class="dualPane ? 'dual-pane' : 'single-pane'">
+            <!-- Left Pane (Primary) -->
+            <div class="pane">
+                <!-- Breadcrumb -->
+                <div class="breadcrumb">
+                    <a @click="loadRoots">Roots</a>
+                    <template v-if="currentPath">
+                        <template v-for="(part, i) in pathParts" :key="i">
+                            <span class="sep">/</span>
+                            <a v-if="i < pathParts.length - 1" @click="browseTo(pathParts.slice(0, i + 1))">{{ part }}</a>
+                            <strong v-else>{{ part }}</strong>
+                        </template>
                     </template>
-                </template>
-            </div>
-
-            <!-- Stats Bar -->
-            <div class="stats-bar" v-if="currentPath">
-                <span class="stat"><span class="stat-value">{{ folderCount }}</span> folder{{ folderCount !== 1 ? 's' : '' }}</span>
-                <span class="stat"><span class="stat-value">{{ fileCount }}</span> file{{ fileCount !== 1 ? 's' : '' }}</span>
-                <span class="stat"><span class="stat-value">{{ formatSize(totalSize) }}</span> total</span>
-            </div>
-
-            <!-- Content -->
-            <div v-if="loading" class="loading">Loading...</div>
-            <div v-else-if="error" class="error-message">{{ error }}</div>
-
-            <!-- Roots List -->
-            <div v-else-if="!currentPath" class="roots-list">
-                <div v-if="roots.length === 0" class="empty-message">
-                    No monitored folders. Use "q2 addfolder &lt;path&gt;" to add folders.
                 </div>
-                <div v-for="root in roots" :key="root.path" class="root-item" @click="browse(root.path)">
-                    <span class="icon">📁</span>
-                    <div>
-                        <strong>{{ root.name }}</strong>
-                        <div class="path">{{ root.path }}</div>
-                    </div>
-                </div>
-            </div>
 
-            <!-- File Table -->
-            <table v-else>
-                <thead>
-                    <tr>
-                        <th @click="changeSort('name')">Name <span class="sort-indicator">{{ sortIndicator('name') }}</span></th>
-                        <th @click="changeSort('type')">Type <span class="sort-indicator">{{ sortIndicator('type') }}</span></th>
-                        <th @click="changeSort('size')">Size <span class="sort-indicator">{{ sortIndicator('size') }}</span></th>
-                        <th @click="changeSort('modified')">Modified <span class="sort-indicator">{{ sortIndicator('modified') }}</span></th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr v-if="sortedEntries.length === 0">
-                        <td colspan="4" class="empty-message">This folder is empty</td>
-                    </tr>
-                    <tr v-for="entry in sortedEntries" :key="entry.name">
-                        <td class="name-cell">
-                            <span class="icon">{{ entry.type === 'dir' ? '📁' : (isAudio(entry.name) ? '🎵' : (isImage(entry.name) ? '🖼️' : (isVideo(entry.name) ? '🎬' : '📄'))) }}</span>
-                            <a v-if="entry.type === 'dir'" class="folder-link" @click="browse(fullPath(entry.name))">{{ entry.name }}</a>
-                            <span v-else-if="isImage(entry.name)" class="file-name image-file" @click="openImage(entry)">{{ entry.name }}</span>
-                            <span v-else-if="isVideo(entry.name)" class="file-name video-file" @click="openVideo(entry)">{{ entry.name }}</span>
-                            <span v-else class="file-name">{{ entry.name }}</span>
-                            <div v-if="isAudio(entry.name)" class="audio-controls">
-                                <button class="audio-btn play" @click.stop="playNow(entry)" title="Play now">▶</button>
-                                <button class="audio-btn" @click.stop="addToQueueTop(entry)" title="Add to top of queue">⬆Q</button>
-                                <button class="audio-btn" @click.stop="addToQueueBottom(entry)" title="Add to bottom of queue">Q⬇</button>
+                <!-- Stats Bar -->
+                <div class="stats-bar" v-if="currentPath">
+                    <span class="stat"><span class="stat-value">{{ folderCount }}</span> folder{{ folderCount !== 1 ? 's' : '' }}</span>
+                    <span class="stat"><span class="stat-value">{{ fileCount }}</span> file{{ fileCount !== 1 ? 's' : '' }}</span>
+                    <span class="stat"><span class="stat-value">{{ formatSize(totalSize) }}</span> total</span>
+                </div>
+
+                <!-- Content -->
+                <div class="pane-content">
+                    <div v-if="loading" class="loading">Loading...</div>
+                    <div v-else-if="error" class="error-message">{{ error }}</div>
+
+                    <!-- Roots List -->
+                    <div v-else-if="!currentPath" class="roots-list">
+                        <div v-if="roots.length === 0" class="empty-message">
+                            No monitored folders. Use "q2 addfolder &lt;path&gt;" to add folders.
+                        </div>
+                        <div v-for="root in roots" :key="root.path" class="root-item" @click="browse(root.path)">
+                            <span class="icon">📁</span>
+                            <div>
+                                <strong>{{ root.name }}</strong>
+                                <div class="path">{{ root.path }}</div>
                             </div>
-                        </td>
-                        <td class="type-cell">{{ entry.type === 'dir' ? 'Folder' : getExtension(entry.name) || 'File' }}</td>
-                        <td class="size-cell">{{ entry.type === 'dir' ? '-' : formatSize(entry.size) }}</td>
-                        <td class="modified-cell">{{ formatDate(entry.modified) }}</td>
-                    </tr>
-                </tbody>
-            </table>
+                        </div>
+                    </div>
+
+                    <!-- File Table -->
+                    <table v-else>
+                        <thead>
+                            <tr>
+                                <th @click="changeSort('name')">Name <span class="sort-indicator">{{ sortIndicator('name') }}</span></th>
+                                <th @click="changeSort('type')">Type <span class="sort-indicator">{{ sortIndicator('type') }}</span></th>
+                                <th @click="changeSort('size')">Size <span class="sort-indicator">{{ sortIndicator('size') }}</span></th>
+                                <th @click="changeSort('modified')">Modified <span class="sort-indicator">{{ sortIndicator('modified') }}</span></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="sortedEntries.length === 0">
+                                <td colspan="4" class="empty-message">This folder is empty</td>
+                            </tr>
+                            <tr v-for="entry in sortedEntries" :key="entry.name">
+                                <td class="name-cell">
+                                    <span class="icon">{{ entry.type === 'dir' ? '📁' : (isAudio(entry.name) ? '🎵' : (isImage(entry.name) ? '🖼️' : (isVideo(entry.name) ? '🎬' : '📄'))) }}</span>
+                                    <a v-if="entry.type === 'dir'" class="folder-link" @click="browse(fullPath(entry.name))">{{ entry.name }}</a>
+                                    <span v-else-if="isImage(entry.name)" class="file-name image-file" @click="openImage(entry)">{{ entry.name }}</span>
+                                    <span v-else-if="isVideo(entry.name)" class="file-name video-file" @click="openVideo(entry)">{{ entry.name }}</span>
+                                    <span v-else class="file-name">{{ entry.name }}</span>
+                                    <div v-if="isAudio(entry.name)" class="audio-controls">
+                                        <button class="audio-btn play" @click.stop="playNow(entry)" title="Play now">▶</button>
+                                        <button class="audio-btn" @click.stop="addToQueueTop(entry)" title="Add to top of queue">⬆Q</button>
+                                        <button class="audio-btn" @click.stop="addToQueueBottom(entry)" title="Add to bottom of queue">Q⬇</button>
+                                    </div>
+                                </td>
+                                <td class="type-cell">{{ entry.type === 'dir' ? 'Folder' : getExtension(entry.name) || 'File' }}</td>
+                                <td class="size-cell">{{ entry.type === 'dir' ? '-' : formatSize(entry.size) }}</td>
+                                <td class="modified-cell">{{ formatDate(entry.modified) }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Right Pane (Secondary) - Only shown in dual pane mode -->
+            <div class="pane" v-if="dualPane">
+                <!-- Breadcrumb -->
+                <div class="breadcrumb">
+                    <a @click="loadRoots2">Roots</a>
+                    <template v-if="pane2Path">
+                        <template v-for="(part, i) in pane2PathParts" :key="i">
+                            <span class="sep">/</span>
+                            <a v-if="i < pane2PathParts.length - 1" @click="browseTo2(pane2PathParts.slice(0, i + 1))">{{ part }}</a>
+                            <strong v-else>{{ part }}</strong>
+                        </template>
+                    </template>
+                </div>
+
+                <!-- Stats Bar -->
+                <div class="stats-bar" v-if="pane2Path">
+                    <span class="stat"><span class="stat-value">{{ pane2FolderCount }}</span> folder{{ pane2FolderCount !== 1 ? 's' : '' }}</span>
+                    <span class="stat"><span class="stat-value">{{ pane2FileCount }}</span> file{{ pane2FileCount !== 1 ? 's' : '' }}</span>
+                    <span class="stat"><span class="stat-value">{{ formatSize(pane2TotalSize) }}</span> total</span>
+                </div>
+
+                <!-- Content -->
+                <div class="pane-content">
+                    <div v-if="pane2Loading" class="loading">Loading...</div>
+                    <div v-else-if="pane2Error" class="error-message">{{ pane2Error }}</div>
+
+                    <!-- Roots List -->
+                    <div v-else-if="!pane2Path" class="roots-list">
+                        <div v-if="roots.length === 0" class="empty-message">
+                            No monitored folders. Use "q2 addfolder &lt;path&gt;" to add folders.
+                        </div>
+                        <div v-for="root in roots" :key="root.path" class="root-item" @click="browse2(root.path)">
+                            <span class="icon">📁</span>
+                            <div>
+                                <strong>{{ root.name }}</strong>
+                                <div class="path">{{ root.path }}</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- File Table -->
+                    <table v-else>
+                        <thead>
+                            <tr>
+                                <th @click="changeSort2('name')">Name <span class="sort-indicator">{{ sortIndicator2('name') }}</span></th>
+                                <th @click="changeSort2('type')">Type <span class="sort-indicator">{{ sortIndicator2('type') }}</span></th>
+                                <th @click="changeSort2('size')">Size <span class="sort-indicator">{{ sortIndicator2('size') }}</span></th>
+                                <th @click="changeSort2('modified')">Modified <span class="sort-indicator">{{ sortIndicator2('modified') }}</span></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="pane2SortedEntries.length === 0">
+                                <td colspan="4" class="empty-message">This folder is empty</td>
+                            </tr>
+                            <tr v-for="entry in pane2SortedEntries" :key="entry.name">
+                                <td class="name-cell">
+                                    <span class="icon">{{ entry.type === 'dir' ? '📁' : (isAudio(entry.name) ? '🎵' : (isImage(entry.name) ? '🖼️' : (isVideo(entry.name) ? '🎬' : '📄'))) }}</span>
+                                    <a v-if="entry.type === 'dir'" class="folder-link" @click="browse2(pane2FullPath(entry.name))">{{ entry.name }}</a>
+                                    <span v-else-if="isImage(entry.name)" class="file-name image-file" @click="openImage2(entry)">{{ entry.name }}</span>
+                                    <span v-else-if="isVideo(entry.name)" class="file-name video-file" @click="openVideo2(entry)">{{ entry.name }}</span>
+                                    <span v-else class="file-name">{{ entry.name }}</span>
+                                    <div v-if="isAudio(entry.name)" class="audio-controls">
+                                        <button class="audio-btn play" @click.stop="playNow2(entry)" title="Play now">▶</button>
+                                        <button class="audio-btn" @click.stop="addToQueueTop2(entry)" title="Add to top of queue">⬆Q</button>
+                                        <button class="audio-btn" @click.stop="addToQueueBottom2(entry)" title="Add to bottom of queue">Q⬇</button>
+                                    </div>
+                                </td>
+                                <td class="type-cell">{{ entry.type === 'dir' ? 'Folder' : getExtension(entry.name) || 'File' }}</td>
+                                <td class="size-cell">{{ entry.type === 'dir' ? '-' : formatSize(entry.size) }}</td>
+                                <td class="modified-cell">{{ formatDate(entry.modified) }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
         <!-- Audio Player -->
@@ -859,28 +1245,32 @@ const browsePageHTML = `<!DOCTYPE html>
         <div class="cast-panel" :class="{ hidden: !showCastPanel }">
             <div class="cast-header">
                 <h3>Cast to device</h3>
+                <button v-if="!castScanning" class="cast-refresh" @click="scanCastDevices">Refresh</button>
+                <span v-else class="cast-scanning">Scanning...</span>
             </div>
             <div class="cast-list">
-                <div v-if="!castAvailable" class="cast-unavailable">
-                    Cast is not available.<br>
-                    <small>Requires Chrome/Edge browser</small>
+                <div class="cast-device" :class="{ active: !isCasting }" @click="stopCasting">
+                    <span class="icon">💻</span>
+                    <span class="name">This device</span>
+                    <span v-if="!isCasting" class="status">Playing</span>
                 </div>
-                <template v-else>
-                    <div class="cast-device" :class="{ active: !isCasting }" @click="stopCasting">
-                        <span class="icon">💻</span>
-                        <span class="name">This device</span>
-                        <span v-if="!isCasting" class="status">Playing</span>
-                    </div>
-                    <div v-if="isCasting" class="cast-device active">
-                        <span class="icon">📺</span>
-                        <span class="name">{{ castingTo }}</span>
-                        <span class="status">Casting</span>
-                    </div>
-                    <div v-if="!isCasting" class="cast-device cast-select" @click="openCastPicker">
-                        <span class="icon">🔍</span>
-                        <span class="name">Cast to a device...</span>
-                    </div>
-                </template>
+                <div v-if="isCasting" class="cast-device active">
+                    <span class="icon">📺</span>
+                    <span class="name">{{ castingTo }}</span>
+                    <span class="status">Casting</span>
+                </div>
+                <div v-for="device in castDevices" :key="device.uuid"
+                     class="cast-device"
+                     :class="{ active: isCasting && castingTo === device.name }"
+                     @click="connectCastDevice(device)">
+                    <span class="icon">📺</span>
+                    <span class="name">{{ device.name }}</span>
+                    <span class="status">{{ device.device_type }}</span>
+                </div>
+                <div v-if="castDevices.length === 0 && !castScanning" class="cast-unavailable">
+                    No devices found.<br>
+                    <small>Click Refresh to scan</small>
+                </div>
             </div>
         </div>
 
@@ -912,7 +1302,7 @@ const browsePageHTML = `<!DOCTYPE html>
                 <button class="image-viewer-close" @click="closeImage">Close (Esc)</button>
             </div>
             <div class="image-viewer-content">
-                <img v-if="viewingImage" :src="'/api/image?path=' + encodeURIComponent(fullPath(viewingImage.name))" :alt="viewingImage.name">
+                <img v-if="viewingImage" :src="'/api/image?path=' + encodeURIComponent(viewingImage._pane2Path ? (viewingImage._pane2Path + '\\\\' + viewingImage.name) : fullPath(viewingImage.name))" :alt="viewingImage.name">
             </div>
             <button class="image-viewer-nav prev" @click="prevImage" :disabled="!canPrevImage">❮</button>
             <button class="image-viewer-nav next" @click="nextImage" :disabled="!canNextImage">❯</button>
@@ -927,7 +1317,7 @@ const browsePageHTML = `<!DOCTYPE html>
             <div class="video-player-content">
                 <video v-if="videoFile"
                        ref="videoRef"
-                       :src="'/api/video?path=' + encodeURIComponent(fullPath(videoFile.name))"
+                       :src="'/api/video?path=' + encodeURIComponent(videoFile._pane2Path ? (videoFile._pane2Path + '\\\\' + videoFile.name) : fullPath(videoFile.name))"
                        @timeupdate="onVideoTimeUpdate"
                        @loadedmetadata="onVideoMetadata"
                        @play="onVideoPlay"
@@ -983,6 +1373,15 @@ const browsePageHTML = `<!DOCTYPE html>
                 const sortColumn = ref('name');
                 const sortAsc = ref(true);
 
+                // Dual pane state
+                const dualPane = ref(false);
+                const pane2Path = ref(null);
+                const pane2Entries = ref([]);
+                const pane2Loading = ref(false);
+                const pane2Error = ref(null);
+                const pane2SortColumn = ref('name');
+                const pane2SortAsc = ref(true);
+
                 // Audio player state
                 const queue = ref([]);
                 const currentIndex = ref(-1);
@@ -993,95 +1392,90 @@ const browsePageHTML = `<!DOCTYPE html>
                 const showQueue = ref(false);
                 const isMuted = ref(false);
 
-                // Cast state
+                // Cast state (backend-based)
                 const showCastPanel = ref(false);
-                const castAvailable = ref(false);
+                const castDevices = ref([]);
+                const castScanning = ref(false);
                 const isCasting = ref(false);
                 const castingTo = ref(null);
-                let castContext = null;
-                let castSession = null;
-                let remotePlayer = null;
-                let remotePlayerController = null;
+                let castStatusInterval = null;
 
-                // Register for Cast SDK callback
-                const initCastWhenReady = () => {
-                    if (typeof cast === 'undefined' || !cast.framework) {
-                        console.log('Cast framework not ready');
-                        return;
-                    }
-
+                // Scan for cast devices via backend (audio devices only for audio player)
+                const scanCastDevices = async () => {
+                    castScanning.value = true;
                     try {
-                        castContext = cast.framework.CastContext.getInstance();
-                        castContext.setOptions({
-                            receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
-                            autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
-                        });
-
-                        castAvailable.value = true;
-                        console.log('Cast SDK initialized successfully');
-
-                        // Create remote player controller
-                        remotePlayer = new cast.framework.RemotePlayer();
-                        remotePlayerController = new cast.framework.RemotePlayerController(remotePlayer);
-
-                        // Listen for session state changes
-                        castContext.addEventListener(
-                            cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
-                            (event) => {
-                                if (event.sessionState === cast.framework.SessionState.SESSION_STARTED ||
-                                    event.sessionState === cast.framework.SessionState.SESSION_RESUMED) {
-                                    castSession = castContext.getCurrentSession();
-                                    isCasting.value = true;
-                                    castingTo.value = castSession.getCastDevice().friendlyName;
-                                    // Pause local audio immediately
-                                    const localAudio = getActiveAudioElement();
-                                    if (localAudio) {
-                                        localAudio.pause();
-                                    }
-                                    // Load current track on Cast device
-                                    if (currentTrack.value) {
-                                        castCurrentTrack();
-                                    } else {
-                                        isPlaying.value = false;
-                                    }
-                                } else if (event.sessionState === cast.framework.SessionState.SESSION_ENDED) {
-                                    castSession = null;
-                                    isCasting.value = false;
-                                    castingTo.value = null;
-                                }
-                            }
-                        );
-
-                        // Listen for remote player changes
-                        remotePlayerController.addEventListener(
-                            cast.framework.RemotePlayerEventType.IS_PAUSED_CHANGED,
-                            () => {
-                                if (isCasting.value) {
-                                    isPlaying.value = !remotePlayer.isPaused;
-                                }
-                            }
-                        );
-
-                        remotePlayerController.addEventListener(
-                            cast.framework.RemotePlayerEventType.CURRENT_TIME_CHANGED,
-                            () => {
-                                if (isCasting.value) {
-                                    currentTime.value = remotePlayer.currentTime;
-                                }
-                            }
-                        );
-
-                        remotePlayerController.addEventListener(
-                            cast.framework.RemotePlayerEventType.DURATION_CHANGED,
-                            () => {
-                                if (isCasting.value) {
-                                    duration.value = remotePlayer.duration;
-                                }
-                            }
-                        );
+                        const resp = await fetch('/api/cast/devices?type=audio');
+                        const data = await resp.json();
+                        if (data.devices) {
+                            castDevices.value = data.devices;
+                        }
                     } catch (e) {
-                        console.error('Failed to initialize Cast:', e);
+                        console.error('Failed to scan cast devices:', e);
                     }
+                    castScanning.value = false;
+                };
+
+                // Connect to a cast device
+                const connectCastDevice = async (device) => {
+                    try {
+                        const resp = await fetch('/api/cast/connect', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ uuid: device.uuid })
+                        });
+                        const data = await resp.json();
+                        if (data.success) {
+                            isCasting.value = true;
+                            castingTo.value = device.name;
+                            showCastPanel.value = false;
+                            // Pause local audio
+                            const localAudio = getActiveAudioElement();
+                            if (localAudio) {
+                                localAudio.pause();
+                            }
+                            // Start status polling
+                            startCastStatusPolling();
+                            // Cast current track if one is loaded
+                            if (currentTrack.value) {
+                                castCurrentTrack();
+                            }
+                        } else {
+                            console.error('Failed to connect:', data.error);
+                        }
+                    } catch (e) {
+                        console.error('Failed to connect to cast device:', e);
+                    }
+                };
+
+                // Start polling cast status
+                const startCastStatusPolling = () => {
+                    if (castStatusInterval) return;
+                    castStatusInterval = setInterval(async () => {
+                        if (!isCasting.value) {
+                            clearInterval(castStatusInterval);
+                            castStatusInterval = null;
+                            return;
+                        }
+                        try {
+                            const resp = await fetch('/api/cast/status');
+                            const status = await resp.json();
+                            if (status.connected) {
+                                if (status.player_state === 'PLAYING') {
+                                    isPlaying.value = true;
+                                } else if (status.player_state === 'PAUSED') {
+                                    isPlaying.value = false;
+                                }
+                                currentTime.value = status.current_time;
+                                duration.value = status.duration;
+                            } else {
+                                // Connection lost
+                                isCasting.value = false;
+                                castingTo.value = null;
+                            }
+                        } catch (e) {
+                            console.error('Failed to get cast status:', e);
+                        }
+                    }, 1000);
                 };
 
                 // Image viewer state
@@ -1166,6 +1560,41 @@ const browsePageHTML = `<!DOCTYPE html>
                 const canNextImage = computed(() =>
                     currentImageIndex.value >= 0 && currentImageIndex.value < imageList.value.length - 1
                 );
+
+                // Pane 2 computed properties
+                const pane2PathParts = computed(() => {
+                    if (!pane2Path.value) return [];
+                    return pane2Path.value.split(/[\\/]/).filter(p => p);
+                });
+
+                const pane2FolderCount = computed(() => pane2Entries.value.filter(e => e.type === 'dir').length);
+                const pane2FileCount = computed(() => pane2Entries.value.filter(e => e.type === 'file').length);
+                const pane2TotalSize = computed(() => pane2Entries.value.filter(e => e.type === 'file').reduce((sum, e) => sum + e.size, 0));
+
+                const pane2SortedEntries = computed(() => {
+                    const sorted = [...pane2Entries.value].sort((a, b) => {
+                        if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+                        let cmp = 0;
+                        switch (pane2SortColumn.value) {
+                            case 'name':
+                                cmp = a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+                                break;
+                            case 'type':
+                                cmp = getExtension(a.name).localeCompare(getExtension(b.name));
+                                break;
+                            case 'size':
+                                cmp = a.size - b.size;
+                                break;
+                            case 'modified':
+                                cmp = new Date(a.modified) - new Date(b.modified);
+                                break;
+                        }
+                        return pane2SortAsc.value ? cmp : -cmp;
+                    });
+                    return sorted;
+                });
+
+                const pane2FullPath = (name) => pane2Path.value ? pane2Path.value + '\\' + name : name;
 
                 // Helper functions
                 const formatSize = (bytes) => {
@@ -1252,6 +1681,96 @@ const browsePageHTML = `<!DOCTYPE html>
                         sortColumn.value = column;
                         sortAsc.value = true;
                     }
+                };
+
+                // Dual pane toggle and functions
+                const toggleDualPane = () => {
+                    dualPane.value = !dualPane.value;
+                };
+
+                const loadRoots2 = () => {
+                    pane2Path.value = null;
+                    pane2Entries.value = [];
+                    pane2Error.value = null;
+                };
+
+                const browse2 = async (path) => {
+                    pane2Loading.value = true;
+                    pane2Error.value = null;
+                    try {
+                        const resp = await fetch('/api/browse?path=' + encodeURIComponent(path));
+                        const data = await resp.json();
+                        if (data.error) throw new Error(data.error);
+                        pane2Path.value = data.path;
+                        pane2Entries.value = data.entries;
+                        pane2SortColumn.value = 'name';
+                        pane2SortAsc.value = true;
+                    } catch (e) {
+                        pane2Error.value = 'Failed to load: ' + e.message;
+                    }
+                    pane2Loading.value = false;
+                };
+
+                const browseTo2 = (parts) => {
+                    const sep = pane2Path.value.includes('\\') ? '\\' : '/';
+                    let path = parts.join(sep);
+                    if (pane2Path.value.match(/^[a-zA-Z]:/)) {
+                        path = parts[0] + (parts.length > 1 ? sep + parts.slice(1).join(sep) : '');
+                    }
+                    browse2(path);
+                };
+
+                const changeSort2 = (column) => {
+                    if (pane2SortColumn.value === column) {
+                        pane2SortAsc.value = !pane2SortAsc.value;
+                    } else {
+                        pane2SortColumn.value = column;
+                        pane2SortAsc.value = true;
+                    }
+                };
+
+                const sortIndicator2 = (column) => {
+                    if (pane2SortColumn.value !== column) return '';
+                    return pane2SortAsc.value ? '▲' : '▼';
+                };
+
+                // Pane 2 media functions (use same players, just different path)
+                const openImage2 = (entry) => {
+                    // Use pane2Path for the full path
+                    viewingImage.value = { ...entry, _pane2Path: pane2Path.value };
+                };
+
+                const openVideo2 = (entry) => {
+                    videoFile.value = { ...entry, _pane2Path: pane2Path.value };
+                    videoPlaying.value = false;
+                    videoCurrentTime.value = 0;
+                    videoDuration.value = 0;
+                };
+
+                const playNow2 = (entry) => {
+                    const track = { path: pane2FullPath(entry.name), name: entry.name };
+                    queue.value = [track];
+                    currentIndex.value = -1;
+                    playTrack(0);
+                };
+
+                const addToQueueTop2 = (entry) => {
+                    const track = { path: pane2FullPath(entry.name), name: entry.name };
+                    const insertAt = currentIndex.value >= 0 ? currentIndex.value + 1 : 0;
+                    queue.value.splice(insertAt, 0, track);
+                    if (currentIndex.value < 0 && queue.value.length === 1) {
+                        playTrack(0);
+                    }
+                    saveState();
+                };
+
+                const addToQueueBottom2 = (entry) => {
+                    const track = { path: pane2FullPath(entry.name), name: entry.name };
+                    queue.value.push(track);
+                    if (currentIndex.value < 0 && queue.value.length === 1) {
+                        playTrack(0);
+                    }
+                    saveState();
                 };
 
                 // Image viewer functions
@@ -1436,88 +1955,104 @@ const browsePageHTML = `<!DOCTYPE html>
                     }
                 };
 
-                // Cast functions
+                // Cast functions (backend-based)
                 const toggleCastPanel = () => {
                     showCastPanel.value = !showCastPanel.value;
                     showQueue.value = false; // Close queue panel
-                };
-
-                const openCastPicker = async () => {
-                    if (!castAvailable.value || !castContext) return;
-
-                    try {
-                        // Request a cast session - this opens Chrome's native device picker
-                        await castContext.requestSession();
-                        showCastPanel.value = false;
-                    } catch (err) {
-                        if (err.code !== 'cancel') {
-                            console.log('Cast request failed:', err);
-                        }
+                    // Auto-scan when opening
+                    if (showCastPanel.value && castDevices.value.length === 0) {
+                        scanCastDevices();
                     }
                 };
 
-                const stopCasting = () => {
-                    if (castSession) {
-                        castSession.endSession(true);
+                const stopCasting = async () => {
+                    const wasPlaying = isPlaying.value;
+                    const resumeTime = currentTime.value;
+
+                    try {
+                        await fetch('/api/cast/disconnect', { method: 'POST' });
+                    } catch (e) {
+                        console.error('Failed to disconnect:', e);
+                    }
+                    if (castStatusInterval) {
+                        clearInterval(castStatusInterval);
+                        castStatusInterval = null;
                     }
                     isCasting.value = false;
                     castingTo.value = null;
                     showCastPanel.value = false;
-                };
 
-                const getContentType = (filename) => {
-                    const ext = filename.toLowerCase().split('.').pop();
-                    const types = {
-                        'mp3': 'audio/mpeg',
-                        'wav': 'audio/wav',
-                        'flac': 'audio/flac',
-                        'aac': 'audio/aac',
-                        'ogg': 'audio/ogg',
-                        'wma': 'audio/x-ms-wma',
-                        'm4a': 'audio/mp4'
-                    };
-                    return types[ext] || 'audio/mpeg';
-                };
-
-                const castCurrentTrack = () => {
-                    if (!castSession || !currentTrack.value) return;
-
-                    const wasPlaying = isPlaying.value;
-                    const streamUrl = window.location.origin + '/api/stream?path=' + encodeURIComponent(currentTrack.value.path);
-                    const contentType = getContentType(currentTrack.value.name);
-
-                    console.log('Casting:', streamUrl, 'as', contentType);
-
-                    const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, contentType);
-                    mediaInfo.metadata = new chrome.cast.media.MusicTrackMediaMetadata();
-                    mediaInfo.metadata.title = currentTrack.value.name;
-
-                    const request = new chrome.cast.media.LoadRequest(mediaInfo);
-                    request.autoplay = wasPlaying;
-                    request.currentTime = currentTime.value;
-
-                    castSession.loadMedia(request).then(
-                        () => {
-                            console.log('Media loaded on cast device');
-                            isPlaying.value = wasPlaying;
-                        },
-                        (err) => {
-                            console.error('Failed to load media:', err);
-                            isPlaying.value = false;
+                    // Resume local playback if we were playing and have a track loaded
+                    if (currentTrack.value) {
+                        const audio = getActiveAudioElement();
+                        // Ensure the track is loaded
+                        if (!audio.src || !audio.src.includes(encodeURIComponent(currentTrack.value.path))) {
+                            audio.src = '/api/stream?path=' + encodeURIComponent(currentTrack.value.path);
                         }
-                    );
-                };
-
-                const castTogglePlay = () => {
-                    if (isCasting.value && remotePlayerController) {
-                        remotePlayerController.playOrPause();
+                        audio.currentTime = resumeTime;
+                        if (wasPlaying) {
+                            audio.play().then(() => {
+                                isPlaying.value = true;
+                            }).catch(e => {
+                                console.error('Failed to resume playback:', e);
+                            });
+                        }
                     }
                 };
 
-                const castSeek = (time) => {
-                    if (isCasting.value && remotePlayer) {
-                        remotePlayer.currentTime = time;
-                        remotePlayerController.seek();
+                const castCurrentTrack = async () => {
+                    if (!isCasting.value || !currentTrack.value) return;
+
+                    try {
+                        const resp = await fetch('/api/cast/play', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                path: currentTrack.value.path,
+                                title: currentTrack.value.name
+                            })
+                        });
+                        const data = await resp.json();
+                        if (data.success) {
+                            console.log('Media loaded on cast device:', data.media_url);
+                            isPlaying.value = true;
+                        } else {
+                            console.error('Failed to cast:', data.error);
+                        }
+                        console.log('Cast response:', data);
+                    } catch (e) {
+                        console.error('Failed to cast media:', e);
+                    }
+                };
+
+                const castTogglePlay = async () => {
+                    if (!isCasting.value) return;
+                    try {
+                        if (isPlaying.value) {
+                            const resp = await fetch('/api/cast/pause', { method: 'POST' });
+                            if (resp.ok) isPlaying.value = false;
+                        } else {
+                            const resp = await fetch('/api/cast/resume', { method: 'POST' });
+                            if (resp.ok) isPlaying.value = true;
+                        }
+                    } catch (e) {
+                        console.error('Failed to toggle cast play:', e);
+                    }
+                };
+
+                const castSeek = async (percent) => {
+                    if (!isCasting.value) return;
+                    // Convert percent to seconds using duration
+                    const seekTime = percent * duration.value;
+                    try {
+                        await fetch('/api/cast/seek', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ position: seekTime })
+                        });
+                        currentTime.value = seekTime;
+                    } catch (e) {
+                        console.error('Failed to seek on cast:', e);
                     }
                 };
 
@@ -1833,15 +2368,6 @@ const browsePageHTML = `<!DOCTYPE html>
                     loadRoots();
                     // Add keyboard listener for image viewer
                     document.addEventListener('keydown', handleKeydown);
-                    // Initialize Google Cast
-                    // Register callback for when SDK becomes available
-                    window.__castCallbacks.push((isAvailable) => {
-                        if (isAvailable) initCastWhenReady();
-                    });
-                    // Also check if SDK already loaded
-                    if (window.__castAvailable) {
-                        initCastWhenReady();
-                    }
                 });
 
                 return {
@@ -1850,6 +2376,14 @@ const browsePageHTML = `<!DOCTYPE html>
                     sortColumn, sortAsc, pathParts, folderCount, fileCount, totalSize, sortedEntries,
                     formatSize, formatDate, getExtension, isAudio, isImage, isVideo, fullPath, sortIndicator,
                     loadRoots, browse, browseTo, changeSort,
+
+                    // Dual pane
+                    dualPane, toggleDualPane,
+                    pane2Path, pane2Entries, pane2Loading, pane2Error,
+                    pane2SortColumn, pane2SortAsc, pane2PathParts, pane2FolderCount, pane2FileCount, pane2TotalSize,
+                    pane2SortedEntries, pane2FullPath, sortIndicator2,
+                    loadRoots2, browse2, browseTo2, changeSort2,
+                    openImage2, openVideo2, playNow2, addToQueueTop2, addToQueueBottom2,
 
                     // Image viewer
                     viewingImage, canPrevImage, canNextImage,
@@ -1871,9 +2405,9 @@ const browsePageHTML = `<!DOCTYPE html>
                     onTimeUpdate, onMetadata, onEnded,
                     toggleQueue, removeFromQueue, clearQueue, moveUp, moveDown,
 
-                    // Google Cast
-                    showCastPanel, castAvailable, isCasting, castingTo,
-                    toggleCastPanel, openCastPicker, stopCasting
+                    // Chromecast (backend-based)
+                    showCastPanel, castDevices, castScanning, isCasting, castingTo,
+                    toggleCastPanel, scanCastDevices, connectCastDevice, stopCasting
                 };
             }
         }).mount('#app');
@@ -2450,6 +2984,9 @@ func main() {
 
 		fmt.Println("Q2")
 
+		// Create cast manager - base URL will be set when first request comes in
+		castMgr := cast.NewManager("")
+
 		// Set up HTTP handlers
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", homeEndpoint)
@@ -2461,10 +2998,36 @@ func main() {
 		mux.HandleFunc("/api/image", makeImageHandler(database))
 		mux.HandleFunc("/api/video", makeVideoHandler(database))
 
+		// Cast API endpoints
+		mux.HandleFunc("/api/cast/devices", makeCastDevicesHandler(castMgr))
+		mux.HandleFunc("/api/cast/connect", makeCastConnectHandler(castMgr))
+		mux.HandleFunc("/api/cast/disconnect", makeCastDisconnectHandler(castMgr))
+		mux.HandleFunc("/api/cast/play", makeCastPlayHandler(castMgr))
+		mux.HandleFunc("/api/cast/pause", makeCastPauseHandler(castMgr))
+		mux.HandleFunc("/api/cast/resume", makeCastResumeHandler(castMgr))
+		mux.HandleFunc("/api/cast/stop", makeCastStopHandler(castMgr))
+		mux.HandleFunc("/api/cast/seek", makeCastSeekHandler(castMgr))
+		mux.HandleFunc("/api/cast/volume", makeCastVolumeHandler(castMgr))
+		mux.HandleFunc("/api/cast/status", makeCastStatusHandler(castMgr))
+
+		// Wrapper to set cast manager base URL from first request
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if castMgr.IsConnected() || r.URL.Path == "/api/cast/connect" {
+				// Set base URL from the request if not already set
+				scheme := "http"
+				if r.TLS != nil {
+					scheme = "https"
+				}
+				baseURL := fmt.Sprintf("%s://%s", scheme, r.Host)
+				castMgr.SetBaseURL(baseURL)
+			}
+			mux.ServeHTTP(w, r)
+		})
+
 		addr := fmt.Sprintf(":%d", *port)
 		server := &http.Server{
 			Addr:    addr,
-			Handler: mux,
+			Handler: handler,
 		}
 
 		// Handle shutdown signals
