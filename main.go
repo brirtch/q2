@@ -293,6 +293,9 @@ func makeStreamHandler(database *db.DB) http.HandlerFunc {
 			return
 		}
 
+		// Log stream requests (helps debug Cast issues)
+		fmt.Printf("Stream request from %s: %s (Range: %s)\n", r.RemoteAddr, path, r.Header.Get("Range"))
+
 		// Clean the path
 		path, ok := cleanPath(path)
 		if !ok {
@@ -542,9 +545,9 @@ func makeCastDevicesHandler(castMgr *cast.Manager) http.HandlerFunc {
 			return
 		}
 
-		// Discover devices (5 second timeout)
+		// Discover devices (10 second timeout for better discovery)
 		ctx := r.Context()
-		allDevices, err := castMgr.DiscoverDevices(ctx, 5*time.Second)
+		allDevices, err := castMgr.DiscoverDevices(ctx, 10*time.Second)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
 			return
@@ -1400,11 +1403,11 @@ const browsePageHTML = `<!DOCTYPE html>
                 const castingTo = ref(null);
                 let castStatusInterval = null;
 
-                // Scan for cast devices via backend (audio devices only for audio player)
+                // Scan for cast devices via backend (all devices - any Chromecast can play audio)
                 const scanCastDevices = async () => {
                     castScanning.value = true;
                     try {
-                        const resp = await fetch('/api/cast/devices?type=audio');
+                        const resp = await fetch('/api/cast/devices');
                         const data = await resp.json();
                         if (data.devices) {
                             castDevices.value = data.devices;
