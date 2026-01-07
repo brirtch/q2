@@ -41,6 +41,7 @@ var (
 	metadataRefreshCurrent string
 	metadataRefreshTotal   int
 	metadataRefreshDone    int
+	metadataRefreshQueue   []string // Queue of paths waiting to be refreshed
 )
 
 // MetadataRefreshRequest is the request body for metadata refresh.
@@ -50,29 +51,37 @@ type MetadataRefreshRequest struct {
 
 // MetadataRefreshResponse is the response for metadata refresh start.
 type MetadataRefreshResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success       bool   `json:"success"`
+	Message       string `json:"message"`
+	QueuePosition int    `json:"queue_position,omitempty"` // Position in queue (0 = processing now)
 }
 
 // MetadataStatusResponse is the response for metadata refresh status.
 type MetadataStatusResponse struct {
-	Scanning     bool   `json:"scanning"`
-	Path         string `json:"path,omitempty"`
-	CurrentFile  string `json:"current_file,omitempty"`
-	FilesTotal   int    `json:"files_total"`
-	FilesDone    int    `json:"files_done"`
+	Scanning     bool     `json:"scanning"`
+	Path         string   `json:"path,omitempty"`
+	CurrentFile  string   `json:"current_file,omitempty"`
+	FilesTotal   int      `json:"files_total"`
+	FilesDone    int      `json:"files_done"`
+	Queue        []string `json:"queue,omitempty"`        // Paths waiting in queue
+	QueueLength  int      `json:"queue_length"`           // Number of items in queue
 }
 
 // getMetadataRefreshStatus returns the current metadata refresh status.
 func getMetadataRefreshStatus() MetadataStatusResponse {
 	metadataRefreshMu.RLock()
 	defer metadataRefreshMu.RUnlock()
+	// Make a copy of the queue to avoid data races
+	queueCopy := make([]string, len(metadataRefreshQueue))
+	copy(queueCopy, metadataRefreshQueue)
 	return MetadataStatusResponse{
 		Scanning:    metadataRefreshActive,
 		Path:        metadataRefreshPath,
 		CurrentFile: metadataRefreshCurrent,
 		FilesTotal:  metadataRefreshTotal,
 		FilesDone:   metadataRefreshDone,
+		Queue:       queueCopy,
+		QueueLength: len(queueCopy),
 	}
 }
 
@@ -169,9 +178,19 @@ func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *
 	metadataRefreshMu.Unlock()
 
 	defer func() {
+		// Check if there are more items in the queue
 		metadataRefreshMu.Lock()
-		metadataRefreshActive = false
-		metadataRefreshMu.Unlock()
+		if len(metadataRefreshQueue) > 0 {
+			// Pop the next path from the queue
+			nextPath := metadataRefreshQueue[0]
+			metadataRefreshQueue = metadataRefreshQueue[1:]
+			metadataRefreshMu.Unlock()
+			// Process next item (recursive call in same goroutine)
+			refreshMetadata(database, nextPath, q2Dir, ffmpegMgr)
+		} else {
+			metadataRefreshActive = false
+			metadataRefreshMu.Unlock()
+		}
 	}()
 
 	// First pass: count files
@@ -312,21 +331,56 @@ func makeMetadataRefreshHandler(database *db.DB, q2Dir string, ffmpegMgr *ffmpeg
 		}
 
 		// Check if refresh is already in progress
-		metadataRefreshMu.RLock()
+		metadataRefreshMu.Lock()
 		active := metadataRefreshActive
-		metadataRefreshMu.RUnlock()
+		currentPath := metadataRefreshPath
 
-		if active {
-			writeJSON(w, http.StatusConflict, ErrorResponse{Error: "metadata refresh already in progress"})
+		// Check if this path is already being processed or in queue
+		if active && currentPath == path {
+			metadataRefreshMu.Unlock()
+			writeJSON(w, http.StatusOK, MetadataRefreshResponse{
+				Success:       true,
+				Message:       "Already refreshing this folder",
+				QueuePosition: 0,
+			})
 			return
 		}
+
+		// Check if path is already in queue
+		for i, qPath := range metadataRefreshQueue {
+			if qPath == path {
+				metadataRefreshMu.Unlock()
+				writeJSON(w, http.StatusOK, MetadataRefreshResponse{
+					Success:       true,
+					Message:       "Folder already in queue",
+					QueuePosition: i + 1,
+				})
+				return
+			}
+		}
+
+		if active {
+			// Add to queue
+			metadataRefreshQueue = append(metadataRefreshQueue, path)
+			queuePos := len(metadataRefreshQueue)
+			metadataRefreshMu.Unlock()
+
+			writeJSON(w, http.StatusOK, MetadataRefreshResponse{
+				Success:       true,
+				Message:       fmt.Sprintf("Added to queue (position #%d)", queuePos),
+				QueuePosition: queuePos,
+			})
+			return
+		}
+		metadataRefreshMu.Unlock()
 
 		// Start refresh in background
 		go refreshMetadata(database, path, q2Dir, ffmpegMgr)
 
 		writeJSON(w, http.StatusOK, MetadataRefreshResponse{
-			Success: true,
-			Message: "Metadata refresh started",
+			Success:       true,
+			Message:       "Metadata refresh started",
+			QueuePosition: 0,
 		})
 	}
 }
@@ -2184,6 +2238,7 @@ const browsePageHTML = `<!DOCTYPE html>
         .metadata-progress .progress-bar { width: 100px; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
         .metadata-progress .progress-bar .progress-fill { height: 100%; background: #238636; transition: width 0.3s; }
         .metadata-progress .progress-text { white-space: nowrap; }
+        .metadata-progress .queue-info { color: #f0883e; margin-left: 5px; }
 
         /* Media View */
         .media-view { padding: 20px; }
@@ -2214,16 +2269,19 @@ const browsePageHTML = `<!DOCTYPE html>
             <h1>Q2 File Browser</h1>
             <div class="header-actions">
                 <!-- Metadata Progress -->
-                <div v-if="metadataStatus.scanning" class="metadata-progress">
+                <div v-if="metadataStatus.scanning || metadataStatus.queue_length > 0" class="metadata-progress">
                     <div class="progress-bar">
                         <div class="progress-fill" :style="{ width: metadataProgressPercent + '%' }"></div>
                     </div>
-                    <span class="progress-text">{{ metadataStatus.files_done }}/{{ metadataStatus.files_total }} files</span>
+                    <span class="progress-text">
+                        {{ metadataStatus.files_done }}/{{ metadataStatus.files_total }} files
+                        <span v-if="metadataStatus.queue_length > 0" class="queue-info">(+{{ metadataStatus.queue_length }} queued)</span>
+                    </span>
                 </div>
                 <!-- Refresh Metadata Button -->
-                <button v-if="currentPath" class="refresh-btn" @click="refreshMetadata" :disabled="metadataStatus.scanning">
-                    <span v-if="metadataStatus.scanning" class="spinner"></span>
-                    {{ metadataStatus.scanning ? 'Scanning...' : 'Refresh Metadata' }}
+                <button v-if="currentPath" class="refresh-btn" @click="refreshMetadata" :disabled="isCurrentPathQueued">
+                    <span v-if="isCurrentPathScanning" class="spinner"></span>
+                    {{ refreshButtonText }}
                 </button>
                 <button class="view-toggle" :class="{ active: dualPane }" @click="toggleDualPane">
                     {{ dualPane ? '◫ Dual Pane' : '▢ Single Pane' }}
@@ -2731,7 +2789,9 @@ const browsePageHTML = `<!DOCTYPE html>
                     path: '',
                     current_file: '',
                     files_total: 0,
-                    files_done: 0
+                    files_done: 0,
+                    queue: [],
+                    queue_length: 0
                 });
                 let metadataStatusInterval = null;
 
@@ -2741,13 +2801,42 @@ const browsePageHTML = `<!DOCTYPE html>
                     return Math.round((metadataStatus.value.files_done / metadataStatus.value.files_total) * 100);
                 });
 
+                // Check if current path is being scanned
+                const isCurrentPathScanning = computed(() => {
+                    return metadataStatus.value.scanning && metadataStatus.value.path === currentPath.value;
+                });
+
+                // Check if current path is in the queue (returns position or 0)
+                const currentPathQueuePosition = computed(() => {
+                    if (!currentPath.value || !metadataStatus.value.queue) return 0;
+                    const idx = metadataStatus.value.queue.indexOf(currentPath.value);
+                    return idx >= 0 ? idx + 1 : 0;
+                });
+
+                // Check if current path is already queued or scanning
+                const isCurrentPathQueued = computed(() => {
+                    return isCurrentPathScanning.value || currentPathQueuePosition.value > 0;
+                });
+
+                // Button text for refresh button
+                const refreshButtonText = computed(() => {
+                    if (isCurrentPathScanning.value) {
+                        return 'Scanning...';
+                    }
+                    if (currentPathQueuePosition.value > 0) {
+                        return '#' + currentPathQueuePosition.value + ' in queue';
+                    }
+                    return 'Refresh Metadata';
+                });
+
                 // Check metadata status
                 const checkMetadataStatus = async () => {
                     try {
                         const resp = await fetch('/api/metadata/status');
                         const data = await resp.json();
                         metadataStatus.value = data;
-                        if (!data.scanning && metadataStatusInterval) {
+                        // Stop polling only if not scanning AND queue is empty
+                        if (!data.scanning && data.queue_length === 0 && metadataStatusInterval) {
                             clearInterval(metadataStatusInterval);
                             metadataStatusInterval = null;
                         }
@@ -4070,7 +4159,8 @@ const browsePageHTML = `<!DOCTYPE html>
                     movePlaylistSongUp, movePlaylistSongDown, removeFromPlaylist, deletePlaylist,
 
                     // Metadata refresh
-                    metadataStatus, metadataProgressPercent, refreshMetadata
+                    metadataStatus, metadataProgressPercent, refreshMetadata,
+                    isCurrentPathScanning, isCurrentPathQueued, refreshButtonText
                 };
             }
         }).mount('#app');
