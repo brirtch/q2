@@ -1,22 +1,28 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"jukel.org/q2/cast"
 	"jukel.org/q2/db"
+	"jukel.org/q2/ffmpeg"
+	"jukel.org/q2/media"
 	_ "jukel.org/q2/migrations"
 	"jukel.org/q2/scanner"
 )
@@ -25,6 +31,288 @@ const (
 	q2Dir  = ".q2"
 	dbFile = "q2.db"
 )
+
+// Metadata refresh progress state
+var (
+	metadataRefreshMu      sync.RWMutex
+	metadataRefreshActive  bool
+	metadataRefreshPath    string
+	metadataRefreshCurrent string
+	metadataRefreshTotal   int
+	metadataRefreshDone    int
+)
+
+// MetadataRefreshRequest is the request body for metadata refresh.
+type MetadataRefreshRequest struct {
+	Path string `json:"path"`
+}
+
+// MetadataRefreshResponse is the response for metadata refresh start.
+type MetadataRefreshResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// MetadataStatusResponse is the response for metadata refresh status.
+type MetadataStatusResponse struct {
+	Scanning     bool   `json:"scanning"`
+	Path         string `json:"path,omitempty"`
+	CurrentFile  string `json:"current_file,omitempty"`
+	FilesTotal   int    `json:"files_total"`
+	FilesDone    int    `json:"files_done"`
+}
+
+// getMetadataRefreshStatus returns the current metadata refresh status.
+func getMetadataRefreshStatus() MetadataStatusResponse {
+	metadataRefreshMu.RLock()
+	defer metadataRefreshMu.RUnlock()
+	return MetadataStatusResponse{
+		Scanning:    metadataRefreshActive,
+		Path:        metadataRefreshPath,
+		CurrentFile: metadataRefreshCurrent,
+		FilesTotal:  metadataRefreshTotal,
+		FilesDone:   metadataRefreshDone,
+	}
+}
+
+// getFolderIDForPath finds the folder_id for a given file path.
+func getFolderIDForPath(database *db.DB, filePath string) (int64, error) {
+	// Get all monitored folders
+	rows, err := database.Query("SELECT id, path FROM folders ORDER BY LENGTH(path) DESC")
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	normalizedFilePath := normalizePath(filePath)
+	for rows.Next() {
+		var id int64
+		var folderPath string
+		if err := rows.Scan(&id, &folderPath); err != nil {
+			continue
+		}
+		normalizedFolder := normalizePath(folderPath)
+		// Check if file is within this folder
+		prefix := normalizedFolder
+		if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+			prefix += string(filepath.Separator)
+		}
+		if strings.HasPrefix(normalizedFilePath, prefix) || normalizedFilePath == normalizedFolder {
+			return id, nil
+		}
+	}
+	return 0, fmt.Errorf("no matching folder found for path: %s", filePath)
+}
+
+// upsertFile inserts or updates a file record and returns its ID.
+func upsertFile(database *db.DB, folderID int64, filePath string, info os.FileInfo) (int64, error) {
+	normalizedPath := normalizePath(filePath)
+	filename := filepath.Base(filePath)
+	ext := strings.ToLower(filepath.Ext(filePath))
+
+	// Determine media type
+	var mediaType string
+	if isAudioFile(filePath) {
+		mediaType = "audio"
+	} else if isImageFile(filePath) {
+		mediaType = "image"
+	} else if isVideoFile(filePath) {
+		mediaType = "video"
+	}
+
+	// Try to get existing file
+	var existingID int64
+	row := database.QueryRow("SELECT id FROM files WHERE path = ?", normalizedPath)
+	if err := row.Scan(&existingID); err == nil {
+		// File exists, update it
+		database.Write(`
+			UPDATE files SET
+				filename = ?, extension = ?, mediatype = ?,
+				size = ?, modified_at = ?, indexed_at = CURRENT_TIMESTAMP
+			WHERE id = ?`,
+			filename, ext, mediaType, info.Size(), info.ModTime(), existingID)
+		return existingID, nil
+	}
+
+	// Insert new file
+	result := database.Write(`
+		INSERT INTO files (folder_id, path, filename, extension, mediatype, size, created_at, modified_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		folderID, normalizedPath, filename, ext, mediaType, info.Size(), info.ModTime(), info.ModTime())
+
+	if result.Err != nil {
+		return 0, result.Err
+	}
+	return result.LastInsertID, nil
+}
+
+// refreshMetadata walks a directory and extracts metadata for all audio/image files.
+func refreshMetadata(database *db.DB, rootPath string) {
+	// Set initial state
+	metadataRefreshMu.Lock()
+	metadataRefreshActive = true
+	metadataRefreshPath = rootPath
+	metadataRefreshCurrent = ""
+	metadataRefreshTotal = 0
+	metadataRefreshDone = 0
+	metadataRefreshMu.Unlock()
+
+	defer func() {
+		metadataRefreshMu.Lock()
+		metadataRefreshActive = false
+		metadataRefreshMu.Unlock()
+	}()
+
+	// First pass: count files
+	var totalFiles int
+	filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if isAudioFile(path) || isImageFile(path) {
+			totalFiles++
+		}
+		return nil
+	})
+
+	metadataRefreshMu.Lock()
+	metadataRefreshTotal = totalFiles
+	metadataRefreshMu.Unlock()
+
+	// Second pass: extract metadata
+	filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+
+		isAudio := isAudioFile(path)
+		isImage := isImageFile(path)
+
+		if !isAudio && !isImage {
+			return nil
+		}
+
+		// Update current file
+		metadataRefreshMu.Lock()
+		metadataRefreshCurrent = path
+		metadataRefreshMu.Unlock()
+
+		// Get file info
+		info, err := d.Info()
+		if err != nil {
+			metadataRefreshMu.Lock()
+			metadataRefreshDone++
+			metadataRefreshMu.Unlock()
+			return nil
+		}
+
+		// Get folder ID for this file
+		folderID, err := getFolderIDForPath(database, path)
+		if err != nil {
+			metadataRefreshMu.Lock()
+			metadataRefreshDone++
+			metadataRefreshMu.Unlock()
+			return nil
+		}
+
+		// Upsert the file record
+		fileID, err := upsertFile(database, folderID, path, info)
+		if err != nil {
+			metadataRefreshMu.Lock()
+			metadataRefreshDone++
+			metadataRefreshMu.Unlock()
+			return nil
+		}
+
+		// Extract and save metadata
+		if isAudio {
+			if meta, err := media.ExtractAudioMetadata(path); err == nil {
+				media.SaveAudioMetadata(database, fileID, meta)
+			}
+		} else if isImage {
+			if meta, err := media.ExtractEXIF(path); err == nil {
+				media.SaveImageMetadata(database, fileID, meta)
+			}
+		}
+
+		metadataRefreshMu.Lock()
+		metadataRefreshDone++
+		metadataRefreshMu.Unlock()
+
+		return nil
+	})
+}
+
+// makeMetadataRefreshHandler creates a handler for POST /api/metadata/refresh.
+func makeMetadataRefreshHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req MetadataRefreshRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.Path == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path is required"})
+			return
+		}
+
+		// Clean the path
+		path, ok := cleanPath(req.Path)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid path"})
+			return
+		}
+
+		// Verify path is within monitored folders
+		roots, err := getMonitoredFolders(database)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "database error"})
+			return
+		}
+
+		if isPathWithinRoots(path, roots) == "" {
+			writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "path not within monitored folders"})
+			return
+		}
+
+		// Check if refresh is already in progress
+		metadataRefreshMu.RLock()
+		active := metadataRefreshActive
+		metadataRefreshMu.RUnlock()
+
+		if active {
+			writeJSON(w, http.StatusConflict, ErrorResponse{Error: "metadata refresh already in progress"})
+			return
+		}
+
+		// Start refresh in background
+		go refreshMetadata(database, path)
+
+		writeJSON(w, http.StatusOK, MetadataRefreshResponse{
+			Success: true,
+			Message: "Metadata refresh started",
+		})
+	}
+}
+
+// makeMetadataStatusHandler creates a handler for GET /api/metadata/status.
+func makeMetadataStatusHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		status := getMetadataRefreshStatus()
+		writeJSON(w, http.StatusOK, status)
+	}
+}
 
 // homePageHTML is the HTML for the home page.
 const homePageHTML = `<!DOCTYPE html>
@@ -269,6 +557,128 @@ func isVideoFile(path string) bool {
 	return ok
 }
 
+// isPlaylistFile checks if a file is an M3U8 playlist.
+func isPlaylistFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".m3u8" || ext == ".m3u"
+}
+
+// parseM3U8 parses an M3U8 playlist file and returns the list of songs.
+func parseM3U8(path string) ([]PlaylistSong, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var songs []PlaylistSong
+	scanner := bufio.NewScanner(file)
+	var currentTitle string
+	var currentDuration int
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if strings.HasPrefix(line, "#EXTM3U") {
+			continue // Header
+		}
+
+		if strings.HasPrefix(line, "#EXTINF:") {
+			// Parse #EXTINF:duration,title
+			info := strings.TrimPrefix(line, "#EXTINF:")
+			parts := strings.SplitN(info, ",", 2)
+			if len(parts) >= 1 {
+				currentDuration, _ = strconv.Atoi(strings.TrimSpace(parts[0]))
+			}
+			if len(parts) >= 2 {
+				currentTitle = strings.TrimSpace(parts[1])
+			}
+			continue
+		}
+
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue // Comment or empty
+		}
+
+		// This is a file path
+		title := currentTitle
+		if title == "" {
+			title = filepath.Base(line)
+		}
+		songs = append(songs, PlaylistSong{
+			Path:     line,
+			Title:    title,
+			Duration: currentDuration,
+		})
+		currentTitle = ""
+		currentDuration = 0
+	}
+
+	return songs, scanner.Err()
+}
+
+// writeM3U8 writes a playlist to an M3U8 file.
+func writeM3U8(path string, songs []PlaylistSong) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Write header
+	fmt.Fprintln(file, "#EXTM3U")
+
+	for _, song := range songs {
+		// Write EXTINF line
+		fmt.Fprintf(file, "#EXTINF:%d,%s\n", song.Duration, song.Title)
+		// Write path
+		fmt.Fprintln(file, song.Path)
+	}
+
+	return nil
+}
+
+// sanitizePlaylistName sanitizes a playlist name to be a valid filename.
+func sanitizePlaylistName(name string) string {
+	// Remove or replace invalid filename characters
+	invalid := []string{"<", ">", ":", "\"", "/", "\\", "|", "?", "*"}
+	result := name
+	for _, char := range invalid {
+		result = strings.ReplaceAll(result, char, "_")
+	}
+	// Trim spaces and dots from ends
+	result = strings.Trim(result, " .")
+	if result == "" {
+		result = "Untitled"
+	}
+	return result
+}
+
+// ensurePlaylistsFolder creates the playlists directory and adds it as a monitored folder.
+func ensurePlaylistsFolder(baseDir string, database *db.DB) (string, error) {
+	playlistDir := filepath.Join(baseDir, "playlists")
+
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(playlistDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create playlists directory: %w", err)
+	}
+
+	// Get absolute path
+	absPath, err := filepath.Abs(playlistDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve playlists path: %w", err)
+	}
+
+	// Add as monitored folder (silently ignore if already exists)
+	normalizedPath := normalizePath(absPath)
+	database.Write(
+		"INSERT OR IGNORE INTO folders (path) VALUES (?)",
+		normalizedPath,
+	)
+
+	return absPath, nil
+}
+
 // makeStreamHandler creates a handler for /api/stream that serves audio files.
 // Supports Range requests for seeking.
 func makeStreamHandler(database *db.DB) http.HandlerFunc {
@@ -435,8 +845,8 @@ func makeImageHandler(database *db.DB) http.HandlerFunc {
 }
 
 // makeVideoHandler creates a handler for /api/video that serves video files.
-// Supports Range requests for seeking.
-func makeVideoHandler(database *db.DB) http.HandlerFunc {
+// Supports Range requests for seeking. Automatically transcodes incompatible audio codecs.
+func makeVideoHandler(database *db.DB, ffmpegMgr *ffmpeg.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Handle CORS preflight for Chromecast
 		if r.Method == http.MethodOptions {
@@ -494,8 +904,47 @@ func makeVideoHandler(database *db.DB) http.HandlerFunc {
 			return
 		}
 
+		// Check if transcoding is needed
+		ctx := r.Context()
+		needsTranscode := false
+		if ffmpegMgr != nil {
+			probe, err := ffmpegMgr.Probe(ctx, path)
+			if err != nil {
+				fmt.Printf("[video] Probe error (will serve directly): %v\n", err)
+			} else if probe.NeedsTranscoding() {
+				fmt.Printf("[video] Audio codec %q needs transcoding\n", probe.GetAudioCodec())
+				needsTranscode = true
+			} else {
+				fmt.Printf("[video] Audio codec %q is browser-compatible\n", probe.GetAudioCodec())
+			}
+		}
+
+		// Set CORS headers (needed for Chromecast)
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
+
+		if needsTranscode {
+			// Transcode audio on the fly
+			w.Header().Set("Content-Type", "video/mp4")
+			// Cannot use Range requests with transcoding
+			w.Header().Set("Accept-Ranges", "none")
+
+			reader, err := ffmpegMgr.TranscodeAudio(ctx, path)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "transcoding failed: " + err.Error()})
+				return
+			}
+			defer reader.Close()
+
+			w.WriteHeader(http.StatusOK)
+			io.Copy(w, reader)
+			return
+		}
+
+		// Serve file directly (supports Range requests)
 		ext := strings.ToLower(filepath.Ext(path))
 		contentType := videoContentTypes[ext]
+		w.Header().Set("Content-Type", contentType)
 
 		file, err := os.Open(path)
 		if err != nil {
@@ -503,11 +952,6 @@ func makeVideoHandler(database *db.DB) http.HandlerFunc {
 			return
 		}
 		defer file.Close()
-
-		// Set content type and CORS headers (needed for Chromecast)
-		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
 
 		http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
 	}
@@ -534,6 +978,70 @@ type CastSeekRequest struct {
 type CastVolumeRequest struct {
 	Level float64 `json:"level"`
 	Muted *bool   `json:"muted,omitempty"`
+}
+
+// PlaylistSong represents a song in a playlist.
+type PlaylistSong struct {
+	Path     string `json:"path"`
+	Title    string `json:"title"`
+	Duration int    `json:"duration"` // seconds
+}
+
+// Playlist represents a playlist with metadata.
+type Playlist struct {
+	Name  string `json:"name"`
+	Path  string `json:"path"`
+	Count int    `json:"count"`
+}
+
+// PlaylistWithContains adds a contains flag for checking if a song is in the playlist.
+type PlaylistWithContains struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Contains bool   `json:"contains"`
+}
+
+// PlaylistResponse is the response for reading a playlist.
+type PlaylistResponse struct {
+	Name  string         `json:"name"`
+	Path  string         `json:"path"`
+	Songs []PlaylistSong `json:"songs"`
+}
+
+// PlaylistsResponse is the response for listing playlists.
+type PlaylistsResponse struct {
+	Playlists []Playlist `json:"playlists"`
+}
+
+// PlaylistCheckResponse is the response for checking which playlists contain a song.
+type PlaylistCheckResponse struct {
+	Playlists []PlaylistWithContains `json:"playlists"`
+}
+
+// PlaylistCreateRequest is the request body for creating a playlist.
+type PlaylistCreateRequest struct {
+	Name string `json:"name"`
+}
+
+// PlaylistAddRequest is the request body for adding a song to a playlist.
+type PlaylistAddRequest struct {
+	Playlist string `json:"playlist"`
+	Song     string `json:"song"`
+	Title    string `json:"title"`
+	Duration int    `json:"duration"`
+}
+
+// PlaylistRemoveRequest is the request body for removing a song from a playlist.
+type PlaylistRemoveRequest struct {
+	Playlist string `json:"playlist"`
+	Index    int    `json:"index"`
+}
+
+// PlaylistReorderRequest is the request body for reordering songs in a playlist.
+type PlaylistReorderRequest struct {
+	Playlist  string `json:"playlist"`
+	FromIndex int    `json:"from_index"`
+	ToIndex   int    `json:"to_index"`
 }
 
 // makeCastDevicesHandler creates a handler for /api/cast/devices.
@@ -797,6 +1305,409 @@ func makeCastStatusHandler(castMgr *cast.Manager) http.HandlerFunc {
 	}
 }
 
+// makePlaylistsHandler creates a handler for /api/playlists (list all playlists).
+func makePlaylistsHandler(playlistDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		entries, err := os.ReadDir(playlistDir)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to read playlists directory"})
+			return
+		}
+
+		var playlists []Playlist
+		for _, entry := range entries {
+			if entry.IsDir() || !isPlaylistFile(entry.Name()) {
+				continue
+			}
+
+			playlistPath := filepath.Join(playlistDir, entry.Name())
+			songs, err := parseM3U8(playlistPath)
+			count := 0
+			if err == nil {
+				count = len(songs)
+			}
+
+			// Get name from filename (without extension)
+			name := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+
+			playlists = append(playlists, Playlist{
+				Name:  name,
+				Path:  playlistPath,
+				Count: count,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, PlaylistsResponse{Playlists: playlists})
+	}
+}
+
+// makePlaylistHandler creates a handler for /api/playlist (CRUD operations).
+func makePlaylistHandler(playlistDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// Read playlist contents
+			path := r.URL.Query().Get("path")
+			if path == "" {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path parameter required"})
+				return
+			}
+
+			// Validate path is within playlists directory
+			absPath, err := filepath.Abs(path)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid path"})
+				return
+			}
+			absPlaylistDir, _ := filepath.Abs(playlistDir)
+			if !strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(absPlaylistDir)) {
+				writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "path outside playlists directory"})
+				return
+			}
+
+			songs, err := parseM3U8(path)
+			if err != nil {
+				writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "playlist not found"})
+				return
+			}
+
+			name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+			writeJSON(w, http.StatusOK, PlaylistResponse{
+				Name:  name,
+				Path:  path,
+				Songs: songs,
+			})
+
+		case http.MethodPost:
+			// Create new playlist
+			var req PlaylistCreateRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+				return
+			}
+
+			if req.Name == "" {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "name is required"})
+				return
+			}
+
+			sanitizedName := sanitizePlaylistName(req.Name)
+			playlistPath := filepath.Join(playlistDir, sanitizedName+".m3u8")
+
+			// Check if already exists
+			if _, err := os.Stat(playlistPath); err == nil {
+				writeJSON(w, http.StatusConflict, ErrorResponse{Error: "playlist already exists"})
+				return
+			}
+
+			// Create empty playlist
+			if err := writeM3U8(playlistPath, []PlaylistSong{}); err != nil {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to create playlist"})
+				return
+			}
+
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"path":    playlistPath,
+				"name":    sanitizedName,
+			})
+
+		case http.MethodDelete:
+			// Delete playlist
+			path := r.URL.Query().Get("path")
+			if path == "" {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path parameter required"})
+				return
+			}
+
+			// Validate path is within playlists directory
+			absPath, err := filepath.Abs(path)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid path"})
+				return
+			}
+			absPlaylistDir, _ := filepath.Abs(playlistDir)
+			if !strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(absPlaylistDir)) {
+				writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "path outside playlists directory"})
+				return
+			}
+
+			if err := os.Remove(path); err != nil {
+				writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "playlist not found"})
+				return
+			}
+
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		}
+	}
+}
+
+// makePlaylistAddHandler creates a handler for /api/playlist/add.
+func makePlaylistAddHandler(playlistDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req PlaylistAddRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.Playlist == "" || req.Song == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "playlist and song are required"})
+			return
+		}
+
+		// Validate playlist path
+		absPath, err := filepath.Abs(req.Playlist)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid playlist path"})
+			return
+		}
+		absPlaylistDir, _ := filepath.Abs(playlistDir)
+		if !strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(absPlaylistDir)) {
+			writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "path outside playlists directory"})
+			return
+		}
+
+		// Read existing playlist
+		songs, err := parseM3U8(req.Playlist)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "playlist not found"})
+			return
+		}
+
+		// Check if song already exists
+		normalizedSong := normalizePath(req.Song)
+		alreadyExists := false
+		for _, song := range songs {
+			if normalizePath(song.Path) == normalizedSong {
+				alreadyExists = true
+				break
+			}
+		}
+
+		if alreadyExists {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success":        true,
+				"already_exists": true,
+			})
+			return
+		}
+
+		// Add song
+		title := req.Title
+		if title == "" {
+			title = filepath.Base(req.Song)
+		}
+		songs = append(songs, PlaylistSong{
+			Path:     req.Song,
+			Title:    title,
+			Duration: req.Duration,
+		})
+
+		// Write updated playlist
+		if err := writeM3U8(req.Playlist, songs); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to update playlist"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success":        true,
+			"already_exists": false,
+		})
+	}
+}
+
+// makePlaylistRemoveHandler creates a handler for /api/playlist/remove.
+func makePlaylistRemoveHandler(playlistDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req PlaylistRemoveRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.Playlist == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "playlist is required"})
+			return
+		}
+
+		// Validate playlist path
+		absPath, err := filepath.Abs(req.Playlist)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid playlist path"})
+			return
+		}
+		absPlaylistDir, _ := filepath.Abs(playlistDir)
+		if !strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(absPlaylistDir)) {
+			writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "path outside playlists directory"})
+			return
+		}
+
+		// Read existing playlist
+		songs, err := parseM3U8(req.Playlist)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "playlist not found"})
+			return
+		}
+
+		// Validate index
+		if req.Index < 0 || req.Index >= len(songs) {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid index"})
+			return
+		}
+
+		// Remove song at index
+		songs = append(songs[:req.Index], songs[req.Index+1:]...)
+
+		// Write updated playlist
+		if err := writeM3U8(req.Playlist, songs); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to update playlist"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	}
+}
+
+// makePlaylistReorderHandler creates a handler for /api/playlist/reorder.
+func makePlaylistReorderHandler(playlistDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req PlaylistReorderRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.Playlist == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "playlist is required"})
+			return
+		}
+
+		// Validate playlist path
+		absPath, err := filepath.Abs(req.Playlist)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid playlist path"})
+			return
+		}
+		absPlaylistDir, _ := filepath.Abs(playlistDir)
+		if !strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(absPlaylistDir)) {
+			writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "path outside playlists directory"})
+			return
+		}
+
+		// Read existing playlist
+		songs, err := parseM3U8(req.Playlist)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "playlist not found"})
+			return
+		}
+
+		// Validate indices
+		if req.FromIndex < 0 || req.FromIndex >= len(songs) ||
+			req.ToIndex < 0 || req.ToIndex >= len(songs) {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid index"})
+			return
+		}
+
+		// Reorder: remove from old position and insert at new position
+		song := songs[req.FromIndex]
+		songs = append(songs[:req.FromIndex], songs[req.FromIndex+1:]...)
+		// Adjust toIndex if needed
+		if req.ToIndex > req.FromIndex {
+			req.ToIndex--
+		}
+		// Insert at new position
+		songs = append(songs[:req.ToIndex+1], songs[req.ToIndex:]...)
+		songs[req.ToIndex] = song
+
+		// Write updated playlist
+		if err := writeM3U8(req.Playlist, songs); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to update playlist"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	}
+}
+
+// makePlaylistCheckHandler creates a handler for /api/playlist/check.
+func makePlaylistCheckHandler(playlistDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		songPath := r.URL.Query().Get("song")
+		if songPath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "song parameter required"})
+			return
+		}
+
+		normalizedSong := normalizePath(songPath)
+
+		entries, err := os.ReadDir(playlistDir)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to read playlists directory"})
+			return
+		}
+
+		var playlists []PlaylistWithContains
+		for _, entry := range entries {
+			if entry.IsDir() || !isPlaylistFile(entry.Name()) {
+				continue
+			}
+
+			playlistPath := filepath.Join(playlistDir, entry.Name())
+			songs, err := parseM3U8(playlistPath)
+			if err != nil {
+				continue
+			}
+
+			// Check if song is in this playlist
+			contains := false
+			for _, s := range songs {
+				if normalizePath(s.Path) == normalizedSong {
+					contains = true
+					break
+				}
+			}
+
+			name := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+			playlists = append(playlists, PlaylistWithContains{
+				Name:     name,
+				Path:     playlistPath,
+				Contains: contains,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, PlaylistCheckResponse{Playlists: playlists})
+	}
+}
+
 // makeBrowseHandler creates a handler for /api/browse.
 func makeBrowseHandler(database *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -1042,6 +1953,60 @@ const browsePageHTML = `<!DOCTYPE html>
         .video-casting-indicator { display: flex; align-items: center; justify-content: center; gap: 15px; padding: 10px 20px; background: #1f6feb33; border-top: 1px solid #1f6feb; color: #58a6ff; font-size: 14px; }
         .stop-casting-btn { background: #30363d; border: 1px solid #484f58; color: #c9d1d9; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
         .stop-casting-btn:hover { background: #484f58; }
+
+        /* Playlist Popup */
+        .playlist-popup { position: fixed; background: #161b22; border: 1px solid #30363d; border-radius: 6px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); z-index: 1001; min-width: 220px; max-width: 300px; }
+        .playlist-popup.hidden { display: none; }
+        .playlist-popup-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 15px; border-bottom: 1px solid #30363d; }
+        .playlist-popup-header span { color: #c9d1d9; font-size: 13px; font-weight: 600; }
+        .playlist-popup-header button { background: none; border: none; color: #6e7681; cursor: pointer; font-size: 18px; padding: 0; line-height: 1; }
+        .playlist-popup-header button:hover { color: #c9d1d9; }
+        .playlist-popup-list { max-height: 250px; overflow-y: auto; }
+        .playlist-popup-item { padding: 10px 15px; cursor: pointer; color: #c9d1d9; display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+        .playlist-popup-item:hover { background: #1f2428; }
+        .already-here { color: #8b949e; font-size: 11px; margin-left: 8px; }
+        .playlist-popup-empty { padding: 15px; text-align: center; color: #6e7681; font-size: 13px; }
+        .playlist-popup-new { padding: 10px 15px; cursor: pointer; color: #58a6ff; border-top: 1px solid #30363d; font-size: 13px; }
+        .playlist-popup-new:hover { background: #1f2428; }
+
+        /* Playlist Viewer */
+        .playlist-viewer { position: fixed; top: 0; left: 0; right: 0; bottom: 80px; background: rgba(0,0,0,0.9); z-index: 998; display: flex; align-items: center; justify-content: center; }
+        .playlist-viewer.hidden { display: none; }
+        .playlist-viewer-content { background: #161b22; border: 1px solid #30363d; border-radius: 8px; width: 90%; max-width: 600px; max-height: 80%; display: flex; flex-direction: column; }
+        .playlist-viewer-header { display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; border-bottom: 1px solid #30363d; }
+        .playlist-viewer-header h2 { margin: 0; color: #c9d1d9; font-size: 18px; }
+        .playlist-viewer-header .close-btn { background: none; border: 1px solid #30363d; color: #c9d1d9; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 18px; }
+        .playlist-viewer-header .close-btn:hover { background: #30363d; }
+        .playlist-viewer-actions { display: flex; gap: 10px; padding: 15px 20px; border-bottom: 1px solid #30363d; }
+        .playlist-viewer-actions button { background: #238636; border: none; color: white; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+        .playlist-viewer-actions button:hover { background: #2ea043; }
+        .playlist-viewer-actions button.danger { background: #30363d; }
+        .playlist-viewer-actions button.danger:hover { background: #da3633; }
+        .playlist-viewer-list { flex: 1; overflow-y: auto; padding: 10px 0; }
+        .playlist-song { display: flex; align-items: center; gap: 10px; padding: 8px 20px; }
+        .playlist-song:hover { background: #1f2428; }
+        .playlist-song .song-num { color: #6e7681; font-size: 12px; min-width: 25px; text-align: right; }
+        .playlist-song .song-title { flex: 1; color: #c9d1d9; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .playlist-song .song-controls { display: flex; gap: 4px; }
+        .playlist-song .song-controls button { background: none; border: 1px solid #30363d; color: #8b949e; width: 28px; height: 28px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+        .playlist-song .song-controls button:hover { background: #238636; color: white; border-color: #238636; }
+        .playlist-song .song-controls button:disabled { opacity: 0.3; cursor: not-allowed; }
+        .playlist-song .song-controls button:disabled:hover { background: none; color: #8b949e; border-color: #30363d; }
+        .playlist-song .song-controls .remove-btn:hover { background: #da3633; border-color: #da3633; }
+        .playlist-empty { padding: 40px 20px; text-align: center; color: #6e7681; font-size: 14px; }
+        .file-name.playlist-file { color: #a371f7; cursor: pointer; }
+        .file-name.playlist-file:hover { text-decoration: underline; }
+        /* Metadata Refresh */
+        .header-actions { display: flex; gap: 10px; align-items: center; }
+        .refresh-btn { background: #238636; border: 1px solid #238636; color: white; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: inherit; display: flex; align-items: center; gap: 6px; }
+        .refresh-btn:hover { background: #2ea043; border-color: #2ea043; }
+        .refresh-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .refresh-btn .spinner { width: 14px; height: 14px; border: 2px solid transparent; border-top-color: white; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .metadata-progress { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #8b949e; display: flex; align-items: center; gap: 10px; }
+        .metadata-progress .progress-bar { width: 100px; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
+        .metadata-progress .progress-bar .progress-fill { height: 100%; background: #238636; transition: width 0.3s; }
+        .metadata-progress .progress-text { white-space: nowrap; }
     </style>
 </head>
 <body>
@@ -1049,9 +2014,23 @@ const browsePageHTML = `<!DOCTYPE html>
         <!-- Header with toggle -->
         <div class="header-bar">
             <h1>Q2 File Browser</h1>
-            <button class="view-toggle" :class="{ active: dualPane }" @click="toggleDualPane">
-                {{ dualPane ? '◫ Dual Pane' : '▢ Single Pane' }}
-            </button>
+            <div class="header-actions">
+                <!-- Metadata Progress -->
+                <div v-if="metadataStatus.scanning" class="metadata-progress">
+                    <div class="progress-bar">
+                        <div class="progress-fill" :style="{ width: metadataProgressPercent + '%' }"></div>
+                    </div>
+                    <span class="progress-text">{{ metadataStatus.files_done }}/{{ metadataStatus.files_total }} files</span>
+                </div>
+                <!-- Refresh Metadata Button -->
+                <button v-if="currentPath" class="refresh-btn" @click="refreshMetadata" :disabled="metadataStatus.scanning">
+                    <span v-if="metadataStatus.scanning" class="spinner"></span>
+                    {{ metadataStatus.scanning ? 'Scanning...' : 'Refresh Metadata' }}
+                </button>
+                <button class="view-toggle" :class="{ active: dualPane }" @click="toggleDualPane">
+                    {{ dualPane ? '◫ Dual Pane' : '▢ Single Pane' }}
+                </button>
+            </div>
         </div>
 
         <!-- Panes Wrapper -->
@@ -1112,8 +2091,9 @@ const browsePageHTML = `<!DOCTYPE html>
                             </tr>
                             <tr v-for="entry in sortedEntries" :key="entry.name">
                                 <td class="name-cell">
-                                    <span class="icon">{{ entry.type === 'dir' ? '📁' : (isAudio(entry.name) ? '🎵' : (isImage(entry.name) ? '🖼️' : (isVideo(entry.name) ? '🎬' : '📄'))) }}</span>
+                                    <span class="icon">{{ entry.type === 'dir' ? '📁' : (isAudio(entry.name) ? '🎵' : (isImage(entry.name) ? '🖼️' : (isVideo(entry.name) ? '🎬' : (isPlaylist(entry.name) ? '📋' : '📄')))) }}</span>
                                     <a v-if="entry.type === 'dir'" class="folder-link" @click="browse(fullPath(entry.name))">{{ entry.name }}</a>
+                                    <span v-else-if="isPlaylist(entry.name)" class="file-name playlist-file" @click="openPlaylist(entry)">{{ entry.name }}</span>
                                     <span v-else-if="isImage(entry.name)" class="file-name image-file" @click="openImage(entry)">{{ entry.name }}</span>
                                     <span v-else-if="isVideo(entry.name)" class="file-name video-file" @click="openVideo(entry)">{{ entry.name }}</span>
                                     <span v-else class="file-name">{{ entry.name }}</span>
@@ -1121,6 +2101,7 @@ const browsePageHTML = `<!DOCTYPE html>
                                         <button class="audio-btn play" @click.stop="playNow(entry)" title="Play now">▶</button>
                                         <button class="audio-btn" @click.stop="addToQueueTop(entry)" title="Add to top of queue">⬆Q</button>
                                         <button class="audio-btn" @click.stop="addToQueueBottom(entry)" title="Add to bottom of queue">Q⬇</button>
+                                        <button class="audio-btn" @click.stop="openPlaylistMenu($event, entry)" title="Add to playlist">...</button>
                                     </div>
                                 </td>
                                 <td class="type-cell">{{ entry.type === 'dir' ? 'Folder' : getExtension(entry.name) || 'File' }}</td>
@@ -1188,8 +2169,9 @@ const browsePageHTML = `<!DOCTYPE html>
                             </tr>
                             <tr v-for="entry in pane2SortedEntries" :key="entry.name">
                                 <td class="name-cell">
-                                    <span class="icon">{{ entry.type === 'dir' ? '📁' : (isAudio(entry.name) ? '🎵' : (isImage(entry.name) ? '🖼️' : (isVideo(entry.name) ? '🎬' : '📄'))) }}</span>
+                                    <span class="icon">{{ entry.type === 'dir' ? '📁' : (isAudio(entry.name) ? '🎵' : (isImage(entry.name) ? '🖼️' : (isVideo(entry.name) ? '🎬' : (isPlaylist(entry.name) ? '📋' : '📄')))) }}</span>
                                     <a v-if="entry.type === 'dir'" class="folder-link" @click="browse2(pane2FullPath(entry.name))">{{ entry.name }}</a>
+                                    <span v-else-if="isPlaylist(entry.name)" class="file-name playlist-file" @click="openPlaylist(entry)">{{ entry.name }}</span>
                                     <span v-else-if="isImage(entry.name)" class="file-name image-file" @click="openImage2(entry)">{{ entry.name }}</span>
                                     <span v-else-if="isVideo(entry.name)" class="file-name video-file" @click="openVideo2(entry)">{{ entry.name }}</span>
                                     <span v-else class="file-name">{{ entry.name }}</span>
@@ -1197,6 +2179,7 @@ const browsePageHTML = `<!DOCTYPE html>
                                         <button class="audio-btn play" @click.stop="playNow2(entry)" title="Play now">▶</button>
                                         <button class="audio-btn" @click.stop="addToQueueTop2(entry)" title="Add to top of queue">⬆Q</button>
                                         <button class="audio-btn" @click.stop="addToQueueBottom2(entry)" title="Add to bottom of queue">Q⬇</button>
+                                        <button class="audio-btn" @click.stop="openPlaylistMenu($event, entry, true)" title="Add to playlist">...</button>
                                     </div>
                                 </td>
                                 <td class="type-cell">{{ entry.type === 'dir' ? 'Folder' : getExtension(entry.name) || 'File' }}</td>
@@ -1205,6 +2188,58 @@ const browsePageHTML = `<!DOCTYPE html>
                             </tr>
                         </tbody>
                     </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Playlist Menu Popup -->
+        <div class="playlist-popup" :class="{ hidden: !showPlaylistMenu }" :style="playlistMenuStyle">
+            <div class="playlist-popup-header">
+                <span>Add to Playlist</span>
+                <button @click="closePlaylistMenu">×</button>
+            </div>
+            <div class="playlist-popup-list">
+                <div v-for="pl in availablePlaylists" :key="pl.path"
+                     class="playlist-popup-item"
+                     @click="addToPlaylist(pl.path)">
+                    {{ pl.name }}
+                    <span v-if="pl.contains" class="already-here">(already here)</span>
+                </div>
+                <div v-if="availablePlaylists.length === 0" class="playlist-popup-empty">
+                    No playlists yet
+                </div>
+                <div class="playlist-popup-new" @click="createNewPlaylist">
+                    + Create new playlist...
+                </div>
+            </div>
+        </div>
+
+        <!-- Playlist Viewer Modal -->
+        <div class="playlist-viewer" :class="{ hidden: !viewingPlaylist }">
+            <div class="playlist-viewer-content">
+                <div class="playlist-viewer-header">
+                    <h2>{{ viewingPlaylist?.name }}</h2>
+                    <button class="close-btn" @click="closePlaylistViewer">×</button>
+                </div>
+                <div class="playlist-viewer-actions">
+                    <button @click="playAllFromPlaylist">▶ Play All</button>
+                    <button @click="shuffleAndPlayPlaylist">🔀 Shuffle</button>
+                    <button @click="deletePlaylist" class="danger">🗑 Delete Playlist</button>
+                </div>
+                <div class="playlist-viewer-list">
+                    <div v-for="(song, i) in playlistSongs" :key="i" class="playlist-song">
+                        <span class="song-num">{{ i + 1 }}</span>
+                        <span class="song-title" :title="song.path">{{ song.title }}</span>
+                        <div class="song-controls">
+                            <button @click="playSongFromPlaylist(i)" title="Play">▶</button>
+                            <button @click="movePlaylistSongUp(i)" :disabled="i === 0" title="Move up">▲</button>
+                            <button @click="movePlaylistSongDown(i)" :disabled="i === playlistSongs.length - 1" title="Move down">▼</button>
+                            <button @click="removeFromPlaylist(i)" title="Remove" class="remove-btn">×</button>
+                        </div>
+                    </div>
+                    <div v-if="playlistSongs.length === 0" class="playlist-empty">
+                        This playlist is empty. Add songs using the "..." button next to audio files.
+                    </div>
                 </div>
             </div>
         </div>
@@ -1403,6 +2438,64 @@ const browsePageHTML = `<!DOCTYPE html>
                 const castingTo = ref(null);
                 let castStatusInterval = null;
 
+                // Metadata refresh state
+                const metadataStatus = ref({
+                    scanning: false,
+                    path: '',
+                    current_file: '',
+                    files_total: 0,
+                    files_done: 0
+                });
+                let metadataStatusInterval = null;
+
+                // Computed property for metadata progress percent
+                const metadataProgressPercent = computed(() => {
+                    if (metadataStatus.value.files_total === 0) return 0;
+                    return Math.round((metadataStatus.value.files_done / metadataStatus.value.files_total) * 100);
+                });
+
+                // Check metadata status
+                const checkMetadataStatus = async () => {
+                    try {
+                        const resp = await fetch('/api/metadata/status');
+                        const data = await resp.json();
+                        metadataStatus.value = data;
+                        if (!data.scanning && metadataStatusInterval) {
+                            clearInterval(metadataStatusInterval);
+                            metadataStatusInterval = null;
+                        }
+                    } catch (e) {
+                        console.error('Failed to check metadata status:', e);
+                    }
+                };
+
+                // Refresh metadata for current folder
+                const refreshMetadata = async () => {
+                    if (!currentPath.value) return;
+                    try {
+                        const resp = await fetch('/api/metadata/refresh', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ path: currentPath.value })
+                        });
+                        const data = await resp.json();
+                        if (data.success) {
+                            // Start polling for status
+                            metadataStatus.value.scanning = true;
+                            if (!metadataStatusInterval) {
+                                metadataStatusInterval = setInterval(checkMetadataStatus, 500);
+                            }
+                        } else if (data.error) {
+                            console.error('Metadata refresh error:', data.error);
+                        }
+                    } catch (e) {
+                        console.error('Failed to refresh metadata:', e);
+                    }
+                };
+
+                // Check metadata status on mount (in case refresh is already running)
+                checkMetadataStatus();
+
                 // Scan for cast devices via backend (all devices - any Chromecast can play audio)
                 const scanCastDevices = async () => {
                     castScanning.value = true;
@@ -1494,6 +2587,16 @@ const browsePageHTML = `<!DOCTYPE html>
                 const isVideoCasting = ref(false);
                 const videoCastingTo = ref(null);
                 let videoCastSession = null;
+
+                // Playlist state
+                const showPlaylistMenu = ref(false);
+                const playlistMenuX = ref(0);
+                const playlistMenuY = ref(0);
+                const playlistMenuSong = ref(null);
+                const playlistMenuPane2 = ref(false);
+                const availablePlaylists = ref([]);
+                const viewingPlaylist = ref(null);
+                const playlistSongs = ref([]);
 
                 // Audio elements
                 const audioA = ref(null);
@@ -1627,6 +2730,15 @@ const browsePageHTML = `<!DOCTYPE html>
                 const isAudio = (name) => AUDIO_EXTENSIONS.includes(getExtension(name));
                 const isImage = (name) => IMAGE_EXTENSIONS.includes(getExtension(name));
                 const isVideo = (name) => VIDEO_EXTENSIONS.includes(getExtension(name));
+                const isPlaylist = (name) => {
+                    const ext = getExtension(name);
+                    return ext === 'm3u8' || ext === 'm3u';
+                };
+
+                const playlistMenuStyle = computed(() => ({
+                    top: playlistMenuY.value + 'px',
+                    left: playlistMenuX.value + 'px'
+                }));
 
                 const fullPath = (name) => {
                     const sep = currentPath.value.includes('\\') ? '\\' : '/';
@@ -2359,6 +3471,204 @@ const browsePageHTML = `<!DOCTYPE html>
                     }
                 };
 
+                // Playlist functions
+                const openPlaylistMenu = async (event, entry, isPane2 = false) => {
+                    const songPath = isPane2 ? pane2FullPath(entry.name) : fullPath(entry.name);
+                    playlistMenuSong.value = { path: songPath, name: entry.name };
+                    playlistMenuPane2.value = isPane2;
+
+                    // Position popup near button
+                    const rect = event.target.getBoundingClientRect();
+                    playlistMenuX.value = Math.min(rect.left, window.innerWidth - 250);
+                    playlistMenuY.value = rect.bottom + 5;
+
+                    // Fetch playlists with contains info
+                    try {
+                        const resp = await fetch('/api/playlist/check?song=' + encodeURIComponent(songPath));
+                        const data = await resp.json();
+                        availablePlaylists.value = data.playlists || [];
+                    } catch (e) {
+                        console.error('Failed to load playlists:', e);
+                        availablePlaylists.value = [];
+                    }
+
+                    showPlaylistMenu.value = true;
+                };
+
+                const closePlaylistMenu = () => {
+                    showPlaylistMenu.value = false;
+                    playlistMenuSong.value = null;
+                };
+
+                const addToPlaylist = async (playlistPath) => {
+                    if (!playlistMenuSong.value) return;
+
+                    try {
+                        await fetch('/api/playlist/add', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                playlist: playlistPath,
+                                song: playlistMenuSong.value.path,
+                                title: playlistMenuSong.value.name,
+                                duration: 0
+                            })
+                        });
+                    } catch (e) {
+                        console.error('Failed to add to playlist:', e);
+                    }
+
+                    closePlaylistMenu();
+                };
+
+                const createNewPlaylist = async () => {
+                    const name = prompt('Enter playlist name:');
+                    if (!name) return;
+
+                    try {
+                        const createResp = await fetch('/api/playlist', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name })
+                        });
+                        const createData = await createResp.json();
+
+                        if (createData.success && playlistMenuSong.value) {
+                            await addToPlaylist(createData.path);
+                        } else {
+                            closePlaylistMenu();
+                        }
+                    } catch (e) {
+                        console.error('Failed to create playlist:', e);
+                        closePlaylistMenu();
+                    }
+                };
+
+                const openPlaylist = async (entry) => {
+                    const path = fullPath(entry.name);
+                    try {
+                        const resp = await fetch('/api/playlist?path=' + encodeURIComponent(path));
+                        const data = await resp.json();
+                        if (data.error) {
+                            console.error('Failed to load playlist:', data.error);
+                            return;
+                        }
+                        viewingPlaylist.value = { name: data.name, path: path };
+                        playlistSongs.value = data.songs || [];
+                    } catch (e) {
+                        console.error('Failed to load playlist:', e);
+                    }
+                };
+
+                const closePlaylistViewer = () => {
+                    viewingPlaylist.value = null;
+                    playlistSongs.value = [];
+                };
+
+                const playAllFromPlaylist = () => {
+                    if (playlistSongs.value.length === 0) return;
+                    queue.value = playlistSongs.value.map(s => ({ path: s.path, name: s.title }));
+                    currentIndex.value = 0;
+                    playTrack(0);
+                    closePlaylistViewer();
+                };
+
+                const shuffleAndPlayPlaylist = () => {
+                    if (playlistSongs.value.length === 0) return;
+                    const shuffled = [...playlistSongs.value].sort(() => Math.random() - 0.5);
+                    queue.value = shuffled.map(s => ({ path: s.path, name: s.title }));
+                    currentIndex.value = 0;
+                    playTrack(0);
+                    closePlaylistViewer();
+                };
+
+                const playSongFromPlaylist = (index) => {
+                    const song = playlistSongs.value[index];
+                    if (!song) return;
+                    queue.value = [{ path: song.path, name: song.title }];
+                    currentIndex.value = 0;
+                    playTrack(0);
+                };
+
+                const movePlaylistSongUp = async (index) => {
+                    if (index <= 0 || !viewingPlaylist.value) return;
+                    try {
+                        await fetch('/api/playlist/reorder', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                playlist: viewingPlaylist.value.path,
+                                from_index: index,
+                                to_index: index - 1
+                            })
+                        });
+                        // Refresh playlist
+                        const resp = await fetch('/api/playlist?path=' + encodeURIComponent(viewingPlaylist.value.path));
+                        const data = await resp.json();
+                        playlistSongs.value = data.songs || [];
+                    } catch (e) {
+                        console.error('Failed to reorder:', e);
+                    }
+                };
+
+                const movePlaylistSongDown = async (index) => {
+                    if (index >= playlistSongs.value.length - 1 || !viewingPlaylist.value) return;
+                    try {
+                        await fetch('/api/playlist/reorder', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                playlist: viewingPlaylist.value.path,
+                                from_index: index,
+                                to_index: index + 1
+                            })
+                        });
+                        // Refresh playlist
+                        const resp = await fetch('/api/playlist?path=' + encodeURIComponent(viewingPlaylist.value.path));
+                        const data = await resp.json();
+                        playlistSongs.value = data.songs || [];
+                    } catch (e) {
+                        console.error('Failed to reorder:', e);
+                    }
+                };
+
+                const removeFromPlaylist = async (index) => {
+                    if (!viewingPlaylist.value) return;
+                    try {
+                        await fetch('/api/playlist/remove', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                playlist: viewingPlaylist.value.path,
+                                index: index
+                            })
+                        });
+                        // Refresh playlist
+                        const resp = await fetch('/api/playlist?path=' + encodeURIComponent(viewingPlaylist.value.path));
+                        const data = await resp.json();
+                        playlistSongs.value = data.songs || [];
+                    } catch (e) {
+                        console.error('Failed to remove song:', e);
+                    }
+                };
+
+                const deletePlaylist = async () => {
+                    if (!viewingPlaylist.value) return;
+                    if (!confirm('Delete playlist "' + viewingPlaylist.value.name + '"?')) return;
+                    try {
+                        await fetch('/api/playlist?path=' + encodeURIComponent(viewingPlaylist.value.path), {
+                            method: 'DELETE'
+                        });
+                        closePlaylistViewer();
+                        // Refresh current directory to update file list
+                        if (currentPath.value) {
+                            browse(currentPath.value);
+                        }
+                    } catch (e) {
+                        console.error('Failed to delete playlist:', e);
+                    }
+                };
+
                 // Watch crossfade setting
                 watch(crossfadeEnabled, () => saveState());
 
@@ -2377,7 +3687,7 @@ const browsePageHTML = `<!DOCTYPE html>
                     // File browser
                     roots, currentPath, entries, loading, error,
                     sortColumn, sortAsc, pathParts, folderCount, fileCount, totalSize, sortedEntries,
-                    formatSize, formatDate, getExtension, isAudio, isImage, isVideo, fullPath, sortIndicator,
+                    formatSize, formatDate, getExtension, isAudio, isImage, isVideo, isPlaylist, fullPath, sortIndicator,
                     loadRoots, browse, browseTo, changeSort,
 
                     // Dual pane
@@ -2410,7 +3720,17 @@ const browsePageHTML = `<!DOCTYPE html>
 
                     // Chromecast (backend-based)
                     showCastPanel, castDevices, castScanning, isCasting, castingTo,
-                    toggleCastPanel, scanCastDevices, connectCastDevice, stopCasting
+                    toggleCastPanel, scanCastDevices, connectCastDevice, stopCasting,
+
+                    // Playlists
+                    showPlaylistMenu, playlistMenuStyle, availablePlaylists,
+                    openPlaylistMenu, closePlaylistMenu, addToPlaylist, createNewPlaylist,
+                    viewingPlaylist, playlistSongs, openPlaylist, closePlaylistViewer,
+                    playAllFromPlaylist, shuffleAndPlayPlaylist, playSongFromPlaylist,
+                    movePlaylistSongUp, movePlaylistSongDown, removeFromPlaylist, deletePlaylist,
+
+                    // Metadata refresh
+                    metadataStatus, metadataProgressPercent, refreshMetadata
                 };
             }
         }).mount('#app');
@@ -2987,8 +4307,19 @@ func main() {
 
 		fmt.Println("Q2")
 
+		// Ensure playlists folder exists and is monitored
+		playlistDir, err := ensurePlaylistsFolder(q2Dir, database)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Warning: could not initialize playlists folder:", err)
+			playlistDir = filepath.Join(q2Dir, "playlists") // Use default path anyway
+		}
+
 		// Create cast manager - base URL will be set when first request comes in
 		castMgr := cast.NewManager("")
+
+		// Create ffmpeg manager for video transcoding
+		ffmpegBinDir := filepath.Join(q2Dir, "bin")
+		ffmpegMgr := ffmpeg.NewManager(ffmpegBinDir)
 
 		// Set up HTTP handlers
 		mux := http.NewServeMux()
@@ -2999,7 +4330,7 @@ func main() {
 		mux.HandleFunc("/api/browse", makeBrowseHandler(database))
 		mux.HandleFunc("/api/stream", makeStreamHandler(database))
 		mux.HandleFunc("/api/image", makeImageHandler(database))
-		mux.HandleFunc("/api/video", makeVideoHandler(database))
+		mux.HandleFunc("/api/video", makeVideoHandler(database, ffmpegMgr))
 
 		// Cast API endpoints
 		mux.HandleFunc("/api/cast/devices", makeCastDevicesHandler(castMgr))
@@ -3012,6 +4343,18 @@ func main() {
 		mux.HandleFunc("/api/cast/seek", makeCastSeekHandler(castMgr))
 		mux.HandleFunc("/api/cast/volume", makeCastVolumeHandler(castMgr))
 		mux.HandleFunc("/api/cast/status", makeCastStatusHandler(castMgr))
+
+		// Playlist API endpoints
+		mux.HandleFunc("/api/playlists", makePlaylistsHandler(playlistDir))
+		mux.HandleFunc("/api/playlist", makePlaylistHandler(playlistDir))
+		mux.HandleFunc("/api/playlist/add", makePlaylistAddHandler(playlistDir))
+		mux.HandleFunc("/api/playlist/remove", makePlaylistRemoveHandler(playlistDir))
+		mux.HandleFunc("/api/playlist/reorder", makePlaylistReorderHandler(playlistDir))
+		mux.HandleFunc("/api/playlist/check", makePlaylistCheckHandler(playlistDir))
+
+		// Metadata refresh endpoints
+		mux.HandleFunc("/api/metadata/refresh", makeMetadataRefreshHandler(database))
+		mux.HandleFunc("/api/metadata/status", makeMetadataStatusHandler())
 
 		// Wrapper to set cast manager base URL from first request
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
