@@ -398,6 +398,96 @@ func makeMetadataStatusHandler() http.HandlerFunc {
 	}
 }
 
+// makeMetadataQueueRemoveHandler creates a handler for DELETE /api/metadata/queue.
+func makeMetadataQueueRemoveHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path is required"})
+			return
+		}
+
+		metadataRefreshMu.Lock()
+		// Find and remove the path from queue
+		found := false
+		for i, qPath := range metadataRefreshQueue {
+			if qPath == path {
+				metadataRefreshQueue = append(metadataRefreshQueue[:i], metadataRefreshQueue[i+1:]...)
+				found = true
+				break
+			}
+		}
+		metadataRefreshMu.Unlock()
+
+		if !found {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "path not in queue"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Removed from queue",
+		})
+	}
+}
+
+// makeMetadataQueuePrioritizeHandler creates a handler for POST /api/metadata/queue/prioritize.
+func makeMetadataQueuePrioritizeHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req struct {
+			Path string `json:"path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.Path == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path is required"})
+			return
+		}
+
+		metadataRefreshMu.Lock()
+		// Find the path in queue
+		foundIdx := -1
+		for i, qPath := range metadataRefreshQueue {
+			if qPath == req.Path {
+				foundIdx = i
+				break
+			}
+		}
+
+		if foundIdx == -1 {
+			metadataRefreshMu.Unlock()
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "path not in queue"})
+			return
+		}
+
+		// Move to front of queue
+		if foundIdx > 0 {
+			path := metadataRefreshQueue[foundIdx]
+			metadataRefreshQueue = append(metadataRefreshQueue[:foundIdx], metadataRefreshQueue[foundIdx+1:]...)
+			metadataRefreshQueue = append([]string{path}, metadataRefreshQueue...)
+		}
+		metadataRefreshMu.Unlock()
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Moved to top of queue",
+		})
+	}
+}
+
 // homePageHTML is the HTML for the home page.
 const homePageHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -2239,6 +2329,32 @@ const browsePageHTML = `<!DOCTYPE html>
         .metadata-progress .progress-bar .progress-fill { height: 100%; background: #238636; transition: width 0.3s; }
         .metadata-progress .progress-text { white-space: nowrap; }
         .metadata-progress .queue-info { color: #f0883e; margin-left: 5px; }
+        .metadata-progress.clickable { cursor: pointer; }
+        .metadata-progress.clickable:hover { background: #1f2428; border-color: #58a6ff; }
+
+        /* Metadata Queue Panel */
+        .metadata-queue-panel { position: fixed; top: 80px; right: 20px; width: 400px; max-height: 500px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); z-index: 999; overflow: hidden; }
+        .metadata-queue-panel.hidden { display: none; }
+        .metadata-queue-header { padding: 15px; background: #0d1117; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; }
+        .metadata-queue-header h3 { margin: 0; font-size: 14px; color: #c9d1d9; }
+        .metadata-queue-close { background: none; border: none; color: #8b949e; cursor: pointer; font-size: 18px; padding: 0; }
+        .metadata-queue-close:hover { color: #c9d1d9; }
+        .metadata-queue-content { max-height: 420px; overflow-y: auto; }
+        .metadata-queue-current { padding: 15px; background: #1f6feb22; border-bottom: 1px solid #30363d; }
+        .metadata-queue-current .label { font-size: 11px; color: #58a6ff; text-transform: uppercase; margin-bottom: 5px; }
+        .metadata-queue-current .path { font-size: 13px; color: #c9d1d9; word-break: break-all; }
+        .metadata-queue-current .progress { font-size: 12px; color: #8b949e; margin-top: 5px; }
+        .metadata-queue-list { padding: 10px 0; }
+        .metadata-queue-item { display: flex; align-items: center; padding: 10px 15px; border-bottom: 1px solid #21262d; gap: 10px; }
+        .metadata-queue-item:hover { background: #1f2428; }
+        .metadata-queue-item .num { color: #6e7681; font-size: 12px; min-width: 20px; }
+        .metadata-queue-item .path { flex: 1; font-size: 13px; color: #c9d1d9; word-break: break-all; }
+        .metadata-queue-item .actions { display: flex; gap: 5px; }
+        .metadata-queue-item .action-btn { background: none; border: 1px solid #30363d; color: #8b949e; width: 28px; height: 28px; border-radius: 4px; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center; }
+        .metadata-queue-item .action-btn:hover { background: #30363d; color: #c9d1d9; }
+        .metadata-queue-item .action-btn.priority:hover { background: #1f6feb; border-color: #1f6feb; color: white; }
+        .metadata-queue-item .action-btn.remove:hover { background: #da3633; border-color: #da3633; color: white; }
+        .metadata-queue-empty { padding: 30px; text-align: center; color: #6e7681; font-size: 13px; }
 
         /* Media View */
         .media-view { padding: 20px; }
@@ -2269,7 +2385,10 @@ const browsePageHTML = `<!DOCTYPE html>
             <h1>Q2 File Browser</h1>
             <div class="header-actions">
                 <!-- Metadata Progress -->
-                <div v-if="metadataStatus.scanning || metadataStatus.queue_length > 0" class="metadata-progress">
+                <div v-if="metadataStatus.scanning || metadataStatus.queue_length > 0"
+                     class="metadata-progress clickable"
+                     @click="toggleMetadataQueuePanel"
+                     title="Click to manage queue">
                     <div class="progress-bar">
                         <div class="progress-fill" :style="{ width: metadataProgressPercent + '%' }"></div>
                     </div>
@@ -2621,6 +2740,37 @@ const browsePageHTML = `<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- Metadata Queue Panel -->
+        <div class="metadata-queue-panel" :class="{ hidden: !showMetadataQueuePanel }">
+            <div class="metadata-queue-header">
+                <h3>Metadata Refresh Queue</h3>
+                <button class="metadata-queue-close" @click="showMetadataQueuePanel = false">×</button>
+            </div>
+            <div class="metadata-queue-content">
+                <!-- Currently scanning -->
+                <div v-if="metadataStatus.scanning" class="metadata-queue-current">
+                    <div class="label">Currently Scanning</div>
+                    <div class="path">{{ metadataStatus.path }}</div>
+                    <div class="progress">{{ metadataStatus.files_done }}/{{ metadataStatus.files_total }} files ({{ metadataProgressPercent }}%)</div>
+                </div>
+                <!-- Queue list -->
+                <div class="metadata-queue-list" v-if="metadataStatus.queue && metadataStatus.queue.length > 0">
+                    <div v-for="(path, i) in metadataStatus.queue" :key="path" class="metadata-queue-item">
+                        <span class="num">#{{ i + 1 }}</span>
+                        <span class="path">{{ path }}</span>
+                        <div class="actions">
+                            <button v-if="i > 0" class="action-btn priority" @click="prioritizeInQueue(path)" title="Move to top">⬆</button>
+                            <button class="action-btn remove" @click="removeFromMetadataQueue(path)" title="Remove">×</button>
+                        </div>
+                    </div>
+                </div>
+                <!-- Empty state -->
+                <div v-if="!metadataStatus.scanning && (!metadataStatus.queue || metadataStatus.queue.length === 0)" class="metadata-queue-empty">
+                    No folders in queue
+                </div>
+            </div>
+        </div>
+
         <!-- Cast Panel -->
         <div class="cast-panel" :class="{ hidden: !showCastPanel }">
             <div class="cast-header">
@@ -2794,6 +2944,7 @@ const browsePageHTML = `<!DOCTYPE html>
                     queue_length: 0
                 });
                 let metadataStatusInterval = null;
+                const showMetadataQueuePanel = ref(false);
 
                 // Computed property for metadata progress percent
                 const metadataProgressPercent = computed(() => {
@@ -2866,6 +3017,43 @@ const browsePageHTML = `<!DOCTYPE html>
                         }
                     } catch (e) {
                         console.error('Failed to refresh metadata:', e);
+                    }
+                };
+
+                // Toggle metadata queue panel
+                const toggleMetadataQueuePanel = () => {
+                    showMetadataQueuePanel.value = !showMetadataQueuePanel.value;
+                };
+
+                // Remove a folder from the metadata queue
+                const removeFromMetadataQueue = async (path) => {
+                    try {
+                        const resp = await fetch('/api/metadata/queue?path=' + encodeURIComponent(path), {
+                            method: 'DELETE'
+                        });
+                        if (resp.ok) {
+                            // Refresh status to update queue display
+                            await checkMetadataStatus();
+                        }
+                    } catch (e) {
+                        console.error('Failed to remove from queue:', e);
+                    }
+                };
+
+                // Move a folder to the top of the queue
+                const prioritizeInQueue = async (path) => {
+                    try {
+                        const resp = await fetch('/api/metadata/queue/prioritize', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ path: path })
+                        });
+                        if (resp.ok) {
+                            // Refresh status to update queue display
+                            await checkMetadataStatus();
+                        }
+                    } catch (e) {
+                        console.error('Failed to prioritize in queue:', e);
                     }
                 };
 
@@ -4160,7 +4348,9 @@ const browsePageHTML = `<!DOCTYPE html>
 
                     // Metadata refresh
                     metadataStatus, metadataProgressPercent, refreshMetadata,
-                    isCurrentPathScanning, isCurrentPathQueued, refreshButtonText
+                    isCurrentPathScanning, isCurrentPathQueued, refreshButtonText,
+                    showMetadataQueuePanel, toggleMetadataQueuePanel,
+                    removeFromMetadataQueue, prioritizeInQueue
                 };
             }
         }).mount('#app');
@@ -4786,6 +4976,8 @@ func main() {
 		// Metadata refresh endpoints
 		mux.HandleFunc("/api/metadata/refresh", makeMetadataRefreshHandler(database, q2Dir, ffmpegMgr))
 		mux.HandleFunc("/api/metadata/status", makeMetadataStatusHandler())
+		mux.HandleFunc("/api/metadata/queue", makeMetadataQueueRemoveHandler())
+		mux.HandleFunc("/api/metadata/queue/prioritize", makeMetadataQueuePrioritizeHandler())
 
 		// Wrapper to set cast manager base URL from first request
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
