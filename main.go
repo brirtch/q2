@@ -146,8 +146,18 @@ func upsertFile(database *db.DB, folderID int64, filePath string, info os.FileIn
 	return result.LastInsertID, nil
 }
 
+// updateFileThumbnails updates the thumbnail paths for a file in the database.
+func updateFileThumbnails(database *db.DB, fileID int64, smallPath, largePath string) {
+	database.Write(`
+		UPDATE files SET
+			thumbnail_small_path = ?,
+			thumbnail_large_path = ?
+		WHERE id = ?`,
+		smallPath, largePath, fileID)
+}
+
 // refreshMetadata walks a directory and extracts metadata for all audio/image files.
-func refreshMetadata(database *db.DB, rootPath string) {
+func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *ffmpeg.Manager) {
 	// Set initial state
 	metadataRefreshMu.Lock()
 	metadataRefreshActive = true
@@ -178,6 +188,9 @@ func refreshMetadata(database *db.DB, rootPath string) {
 	metadataRefreshMu.Lock()
 	metadataRefreshTotal = totalFiles
 	metadataRefreshMu.Unlock()
+
+	// Create a context for thumbnail generation
+	ctx := context.Background()
 
 	// Second pass: extract metadata
 	filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
@@ -233,6 +246,13 @@ func refreshMetadata(database *db.DB, rootPath string) {
 			if meta, err := media.ExtractEXIF(path); err == nil {
 				media.SaveImageMetadata(database, fileID, meta)
 			}
+			// Generate thumbnails for images
+			if ffmpegMgr != nil {
+				smallPath, largePath, err := media.GenerateBothThumbnails(ctx, path, q2Dir, ffmpegMgr)
+				if err == nil {
+					updateFileThumbnails(database, fileID, smallPath, largePath)
+				}
+			}
 		}
 
 		metadataRefreshMu.Lock()
@@ -244,7 +264,7 @@ func refreshMetadata(database *db.DB, rootPath string) {
 }
 
 // makeMetadataRefreshHandler creates a handler for POST /api/metadata/refresh.
-func makeMetadataRefreshHandler(database *db.DB) http.HandlerFunc {
+func makeMetadataRefreshHandler(database *db.DB, q2Dir string, ffmpegMgr *ffmpeg.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
@@ -292,7 +312,7 @@ func makeMetadataRefreshHandler(database *db.DB) http.HandlerFunc {
 		}
 
 		// Start refresh in background
-		go refreshMetadata(database, path)
+		go refreshMetadata(database, path, q2Dir, ffmpegMgr)
 
 		writeJSON(w, http.StatusOK, MetadataRefreshResponse{
 			Success: true,
@@ -841,6 +861,77 @@ func makeImageHandler(database *db.DB) http.HandlerFunc {
 
 		// Use http.ServeContent for caching support
 		http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
+	}
+}
+
+// makeThumbnailHandler creates a handler for /api/thumbnail that serves image thumbnails.
+// Query params: path (original image path), size (small or large)
+func makeThumbnailHandler(database *db.DB, q2Dir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		originalPath := r.URL.Query().Get("path")
+		if originalPath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path parameter required"})
+			return
+		}
+
+		originalPath, ok := cleanPath(originalPath)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid path"})
+			return
+		}
+
+		// Verify path is within monitored folders
+		roots, err := getMonitoredFolders(database)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "database error"})
+			return
+		}
+
+		if isPathWithinRoots(originalPath, roots) == "" {
+			writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "path not within monitored folders"})
+			return
+		}
+
+		// Determine size
+		sizeParam := r.URL.Query().Get("size")
+		var size int
+		switch sizeParam {
+		case "large":
+			size = media.LargeThumbnailSize
+		default:
+			size = media.SmallThumbnailSize
+		}
+
+		// Get the thumbnail path
+		thumbRelPath := media.GetThumbnailPath(originalPath, size)
+		thumbFullPath := filepath.Join(q2Dir, thumbRelPath)
+
+		// Check if thumbnail exists
+		info, err := os.Stat(thumbFullPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "thumbnail not found, run metadata refresh first"})
+			} else {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "cannot access thumbnail"})
+			}
+			return
+		}
+
+		file, err := os.Open(thumbFullPath)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "cannot open thumbnail"})
+			return
+		}
+		defer file.Close()
+
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Cache-Control", "public, max-age=31536000") // Cache for 1 year
+		http.ServeContent(w, r, filepath.Base(thumbFullPath), info.ModTime(), file)
 	}
 }
 
@@ -4330,6 +4421,7 @@ func main() {
 		mux.HandleFunc("/api/browse", makeBrowseHandler(database))
 		mux.HandleFunc("/api/stream", makeStreamHandler(database))
 		mux.HandleFunc("/api/image", makeImageHandler(database))
+		mux.HandleFunc("/api/thumbnail", makeThumbnailHandler(database, q2Dir))
 		mux.HandleFunc("/api/video", makeVideoHandler(database, ffmpegMgr))
 
 		// Cast API endpoints
@@ -4353,7 +4445,7 @@ func main() {
 		mux.HandleFunc("/api/playlist/check", makePlaylistCheckHandler(playlistDir))
 
 		// Metadata refresh endpoints
-		mux.HandleFunc("/api/metadata/refresh", makeMetadataRefreshHandler(database))
+		mux.HandleFunc("/api/metadata/refresh", makeMetadataRefreshHandler(database, q2Dir, ffmpegMgr))
 		mux.HandleFunc("/api/metadata/status", makeMetadataStatusHandler())
 
 		// Wrapper to set cast manager base URL from first request

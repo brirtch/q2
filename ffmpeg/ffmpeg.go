@@ -384,3 +384,32 @@ func (m *Manager) IsAvailable(ctx context.Context) bool {
 	_, err := m.GetFFmpegPath(ctx)
 	return err == nil
 }
+
+// GenerateThumbnail creates a thumbnail image using FFmpeg.
+// The thumbnail fits within a bounding box of the specified size while maintaining aspect ratio.
+// Quality is 2-31 where 2 is best (for JPEG, maps to ~85% quality at value 2-5).
+func (m *Manager) GenerateThumbnail(ctx context.Context, inputPath, outputPath string, size int, quality int) error {
+	ffmpegPath, err := m.GetFFmpegPath(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Scale filter: fit within bounding box, maintain aspect ratio, don't upscale
+	// The expression scales the larger dimension to 'size' and calculates the other proportionally
+	scaleFilter := fmt.Sprintf("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease", size, size)
+
+	cmd := exec.CommandContext(ctx, ffmpegPath,
+		"-i", inputPath,
+		"-vf", scaleFilter,
+		"-qscale:v", fmt.Sprintf("%d", quality), // JPEG quality (2-5 is high quality)
+		"-y", // Overwrite output
+		outputPath,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg thumbnail failed: %w: %s", err, string(output))
+	}
+
+	return nil
+}
