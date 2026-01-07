@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -156,7 +157,7 @@ func updateFileThumbnails(database *db.DB, fileID int64, smallPath, largePath st
 		smallPath, largePath, fileID)
 }
 
-// refreshMetadata walks a directory and extracts metadata for all audio/image files.
+// refreshMetadata walks a directory and extracts metadata for all audio/image/video files.
 func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *ffmpeg.Manager) {
 	// Set initial state
 	metadataRefreshMu.Lock()
@@ -179,7 +180,7 @@ func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		if isAudioFile(path) || isImageFile(path) {
+		if isAudioFile(path) || isImageFile(path) || isVideoFile(path) {
 			totalFiles++
 		}
 		return nil
@@ -200,8 +201,9 @@ func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *
 
 		isAudio := isAudioFile(path)
 		isImage := isImageFile(path)
+		isVideo := isVideoFile(path)
 
-		if !isAudio && !isImage {
+		if !isAudio && !isImage && !isVideo {
 			return nil
 		}
 
@@ -249,6 +251,14 @@ func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *
 			// Generate thumbnails for images
 			if ffmpegMgr != nil {
 				smallPath, largePath, err := media.GenerateBothThumbnails(ctx, path, q2Dir, ffmpegMgr)
+				if err == nil {
+					updateFileThumbnails(database, fileID, smallPath, largePath)
+				}
+			}
+		} else if isVideo {
+			// Generate thumbnails for videos
+			if ffmpegMgr != nil {
+				smallPath, largePath, err := media.GenerateBothVideoThumbnails(ctx, path, q2Dir, ffmpegMgr)
 				if err == nil {
 					updateFileThumbnails(database, fileID, smallPath, largePath)
 				}
@@ -404,6 +414,15 @@ type FileEntry struct {
 	Type     string `json:"type"` // "file" or "dir"
 	Size     int64  `json:"size"`
 	Modified string `json:"modified"` // ISO 8601 format
+	// Optional metadata fields (populated when ?metadata=true)
+	MediaType      string `json:"mediaType,omitempty"`      // "image", "audio", "video", or empty
+	ThumbnailSmall string `json:"thumbnailSmall,omitempty"` // URL to small thumbnail
+	ThumbnailLarge string `json:"thumbnailLarge,omitempty"` // URL to large thumbnail
+	// Audio-specific metadata
+	Title    string `json:"title,omitempty"`
+	Artist   string `json:"artist,omitempty"`
+	Album    string `json:"album,omitempty"`
+	Duration int    `json:"duration,omitempty"` // Duration in seconds
 }
 
 // BrowseResponse is the response for /api/browse.
@@ -1799,8 +1818,67 @@ func makePlaylistCheckHandler(playlistDir string) http.HandlerFunc {
 	}
 }
 
+// enrichEntriesWithMetadata adds metadata to file entries by querying the database.
+func enrichEntriesWithMetadata(database *db.DB, q2Dir string, dirPath string, entries []FileEntry) {
+	for i := range entries {
+		entry := &entries[i]
+
+		// Skip directories
+		if entry.Type == "dir" {
+			continue
+		}
+
+		// Determine media type based on extension
+		fullPath := filepath.Join(dirPath, entry.Name)
+		if isImageFile(fullPath) {
+			entry.MediaType = "image"
+		} else if isAudioFile(fullPath) {
+			entry.MediaType = "audio"
+		} else if isVideoFile(fullPath) {
+			entry.MediaType = "video"
+		}
+
+		// Query database for file metadata
+		normalizedPath := normalizePath(fullPath)
+		row := database.QueryRow(`
+			SELECT f.id, f.thumbnail_small_path, f.thumbnail_large_path,
+			       am.title, am.artist, am.album, am.duration_seconds
+			FROM files f
+			LEFT JOIN audio_metadata am ON f.id = am.file_id
+			WHERE f.path = ?`, normalizedPath)
+
+		var fileID int64
+		var thumbSmall, thumbLarge, title, artist, album *string
+		var duration *int
+
+		if err := row.Scan(&fileID, &thumbSmall, &thumbLarge, &title, &artist, &album, &duration); err == nil {
+			// Set thumbnail URLs if available
+			if thumbSmall != nil && *thumbSmall != "" {
+				entry.ThumbnailSmall = "/api/thumbnail?path=" + url.QueryEscape(fullPath) + "&size=small"
+			}
+			if thumbLarge != nil && *thumbLarge != "" {
+				entry.ThumbnailLarge = "/api/thumbnail?path=" + url.QueryEscape(fullPath) + "&size=large"
+			}
+
+			// Set audio metadata if available
+			if title != nil {
+				entry.Title = *title
+			}
+			if artist != nil {
+				entry.Artist = *artist
+			}
+			if album != nil {
+				entry.Album = *album
+			}
+			if duration != nil {
+				entry.Duration = *duration
+			}
+		}
+	}
+}
+
 // makeBrowseHandler creates a handler for /api/browse.
-func makeBrowseHandler(database *db.DB) http.HandlerFunc {
+func makeBrowseHandler(database *db.DB, q2Dir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
@@ -1812,6 +1890,9 @@ func makeBrowseHandler(database *db.DB) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path parameter required"})
 			return
 		}
+
+		// Check if metadata is requested
+		includeMetadata := r.URL.Query().Get("metadata") == "true"
 
 		// Clean the path
 		path, ok := cleanPath(path)
@@ -1854,6 +1935,11 @@ func makeBrowseHandler(database *db.DB) http.HandlerFunc {
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "cannot read directory"})
 			return
+		}
+
+		// If metadata requested, enrich entries with database info
+		if includeMetadata {
+			enrichEntriesWithMetadata(database, q2Dir, path, entries)
 		}
 
 		// Determine parent path (nil if this is a root folder)
@@ -2098,6 +2184,27 @@ const browsePageHTML = `<!DOCTYPE html>
         .metadata-progress .progress-bar { width: 100px; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
         .metadata-progress .progress-bar .progress-fill { height: 100%; background: #238636; transition: width 0.3s; }
         .metadata-progress .progress-text { white-space: nowrap; }
+
+        /* Media View */
+        .media-view { padding: 20px; }
+        .media-section { margin-bottom: 30px; }
+        .section-header { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #30363d; }
+        .section-header h3 { margin: 0; color: #c9d1d9; font-size: 16px; font-weight: 600; }
+        .section-header .count { color: #8b949e; font-size: 14px; }
+        .thumbnail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 15px; }
+        .thumb-item { display: flex; flex-direction: column; align-items: center; cursor: pointer; padding: 10px; border-radius: 6px; background: #0d1117; border: 1px solid #21262d; transition: all 0.2s; }
+        .thumb-item:hover { background: #1f2428; border-color: #58a6ff; }
+        .thumb-item img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; background: #21262d; }
+        .thumb-item .thumb-name { font-size: 12px; margin-top: 8px; text-align: center; color: #c9d1d9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
+        .thumb-item.video .thumb-name { color: #f0883e; }
+        .audio-table { width: 100%; border-collapse: collapse; background: #0d1117; border-radius: 6px; overflow: hidden; }
+        .audio-table th { background: #161b22; color: #8b949e; font-weight: 600; font-size: 12px; text-transform: uppercase; padding: 10px 15px; text-align: left; }
+        .audio-table td { padding: 10px 15px; border-bottom: 1px solid #21262d; color: #c9d1d9; font-size: 13px; }
+        .audio-table tr { cursor: pointer; transition: background 0.2s; }
+        .audio-table tbody tr:hover { background: #1f2428; }
+        .audio-table .title-col { color: #58a6ff; }
+        .audio-table .duration-col { color: #8b949e; text-align: right; }
+        .other-section table { width: 100%; }
     </style>
 </head>
 <body>
@@ -2120,6 +2227,9 @@ const browsePageHTML = `<!DOCTYPE html>
                 </button>
                 <button class="view-toggle" :class="{ active: dualPane }" @click="toggleDualPane">
                     {{ dualPane ? '◫ Dual Pane' : '▢ Single Pane' }}
+                </button>
+                <button class="view-toggle" :class="{ active: viewMode === 'media' }" @click="toggleViewMode">
+                    {{ viewMode === 'media' ? '🎨 Media View' : '📋 File View' }}
                 </button>
             </div>
         </div>
@@ -2166,8 +2276,8 @@ const browsePageHTML = `<!DOCTYPE html>
                         </div>
                     </div>
 
-                    <!-- File Table -->
-                    <table v-else>
+                    <!-- File Table (File View) -->
+                    <table v-else-if="viewMode === 'file'">
                         <thead>
                             <tr>
                                 <th @click="changeSort('name')">Name <span class="sort-indicator">{{ sortIndicator('name') }}</span></th>
@@ -2201,6 +2311,89 @@ const browsePageHTML = `<!DOCTYPE html>
                             </tr>
                         </tbody>
                     </table>
+
+                    <!-- Media View -->
+                    <div v-else-if="viewMode === 'media'" class="media-view">
+                        <!-- Images Section -->
+                        <div v-if="imageEntries.length" class="media-section">
+                            <h3 class="section-header">Images ({{ imageEntries.length }})</h3>
+                            <div class="thumbnail-grid">
+                                <div v-for="img in imageEntries" :key="img.name" class="thumb-item" @click="openImage(img)">
+                                    <img :src="img.thumbnailSmall || '/api/thumbnail?path=' + encodeURIComponent(fullPath(img.name)) + '&size=small'" :alt="img.name" loading="lazy" @error="handleThumbError">
+                                    <span class="thumb-name">{{ img.name }}</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Audio Section -->
+                        <div v-if="audioEntries.length" class="media-section">
+                            <h3 class="section-header">Audio ({{ audioEntries.length }})</h3>
+                            <table class="audio-table">
+                                <thead>
+                                    <tr>
+                                        <th></th>
+                                        <th>Title</th>
+                                        <th>Artist</th>
+                                        <th>Album</th>
+                                        <th>Duration</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="audio in audioEntries" :key="audio.name" class="audio-row" @dblclick="playNow(audio)">
+                                        <td class="audio-actions">
+                                            <button class="audio-btn play" @click.stop="playNow(audio)" title="Play">▶</button>
+                                        </td>
+                                        <td class="audio-title">{{ audio.title || audio.name }}</td>
+                                        <td class="audio-artist">{{ audio.artist || '-' }}</td>
+                                        <td class="audio-album">{{ audio.album || '-' }}</td>
+                                        <td class="audio-duration">{{ audio.duration ? formatDuration(audio.duration) : '-' }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <!-- Videos Section -->
+                        <div v-if="videoEntries.length" class="media-section">
+                            <h3 class="section-header">Videos ({{ videoEntries.length }})</h3>
+                            <div class="thumbnail-grid">
+                                <div v-for="vid in videoEntries" :key="vid.name" class="thumb-item" @click="openVideo(vid)">
+                                    <img :src="vid.thumbnailSmall || '/api/thumbnail?path=' + encodeURIComponent(fullPath(vid.name)) + '&size=small'" :alt="vid.name" loading="lazy" @error="handleThumbError">
+                                    <span class="thumb-name">{{ vid.name }}</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Other Section (folders + misc files) -->
+                        <div v-if="otherEntries.length" class="media-section">
+                            <h3 class="section-header">Other ({{ otherEntries.length }})</h3>
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Name</th>
+                                        <th>Type</th>
+                                        <th>Size</th>
+                                        <th>Modified</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="entry in otherEntries" :key="entry.name">
+                                        <td class="name-cell">
+                                            <span class="icon">{{ entry.type === 'dir' ? '📁' : '📄' }}</span>
+                                            <a v-if="entry.type === 'dir'" class="folder-link" @click="browse(fullPath(entry.name))">{{ entry.name }}</a>
+                                            <span v-else class="file-name">{{ entry.name }}</span>
+                                        </td>
+                                        <td class="type-cell">{{ entry.type === 'dir' ? 'Folder' : getExtension(entry.name) || 'File' }}</td>
+                                        <td class="size-cell">{{ entry.type === 'dir' ? '-' : formatSize(entry.size) }}</td>
+                                        <td class="modified-cell">{{ formatDate(entry.modified) }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div v-if="!imageEntries.length && !audioEntries.length && !videoEntries.length && !otherEntries.length" class="empty-message">
+                            This folder is empty
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -2511,6 +2704,9 @@ const browsePageHTML = `<!DOCTYPE html>
                 const pane2SortColumn = ref('name');
                 const pane2SortAsc = ref(true);
 
+                // View mode state
+                const viewMode = ref('file'); // 'file' or 'media'
+
                 // Audio player state
                 const queue = ref([]);
                 const currentIndex = ref(-1);
@@ -2743,6 +2939,12 @@ const browsePageHTML = `<!DOCTYPE html>
                     return sorted;
                 });
 
+                // Media view computed properties
+                const imageEntries = computed(() => sortedEntries.value.filter(e => e.type === 'file' && isImage(e.name)));
+                const audioEntries = computed(() => sortedEntries.value.filter(e => e.type === 'file' && isAudio(e.name)));
+                const videoEntries = computed(() => sortedEntries.value.filter(e => e.type === 'file' && isVideo(e.name)));
+                const otherEntries = computed(() => sortedEntries.value.filter(e => e.type === 'dir' || (!isImage(e.name) && !isAudio(e.name) && !isVideo(e.name))));
+
                 // Image list for navigation (filtered to only images)
                 const imageList = computed(() =>
                     sortedEntries.value.filter(e => e.type === 'file' && isImage(e.name))
@@ -2858,7 +3060,27 @@ const browsePageHTML = `<!DOCTYPE html>
                     loading.value = true;
                     error.value = null;
                     try {
-                        const resp = await fetch('/api/browse?path=' + encodeURIComponent(path));
+                        // Include metadata param when in media view mode
+                        const metaParam = viewMode.value === 'media' ? '&metadata=true' : '';
+                        const resp = await fetch('/api/browse?path=' + encodeURIComponent(path) + metaParam);
+                        const data = await resp.json();
+                        if (data.error) throw new Error(data.error);
+                        currentPath.value = data.path;
+                        entries.value = data.entries;
+                        sortColumn.value = 'name';
+                        sortAsc.value = true;
+                    } catch (e) {
+                        error.value = 'Failed to load: ' + e.message;
+                    }
+                    loading.value = false;
+                };
+
+                // Browse with metadata (for media view)
+                const browseWithMetadata = async (path) => {
+                    loading.value = true;
+                    error.value = null;
+                    try {
+                        const resp = await fetch('/api/browse?path=' + encodeURIComponent(path) + '&metadata=true');
                         const data = await resp.json();
                         if (data.error) throw new Error(data.error);
                         currentPath.value = data.path;
@@ -2892,6 +3114,28 @@ const browsePageHTML = `<!DOCTYPE html>
                 // Dual pane toggle and functions
                 const toggleDualPane = () => {
                     dualPane.value = !dualPane.value;
+                };
+
+                // View mode toggle
+                const toggleViewMode = () => {
+                    viewMode.value = viewMode.value === 'file' ? 'media' : 'file';
+                    // Reload with metadata when switching to media view
+                    if (viewMode.value === 'media' && currentPath.value) {
+                        browseWithMetadata(currentPath.value);
+                    }
+                };
+
+                // Format duration in seconds to mm:ss
+                const formatDuration = (seconds) => {
+                    if (!seconds) return '-';
+                    const mins = Math.floor(seconds / 60);
+                    const secs = seconds % 60;
+                    return mins + ':' + String(secs).padStart(2, '0');
+                };
+
+                // Handle thumbnail load error (show placeholder)
+                const handleThumbError = (e) => {
+                    e.target.src = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100"><rect fill="%2321262d" width="100" height="100"/><text x="50" y="55" text-anchor="middle" fill="%236e7681" font-size="12">No Preview</text></svg>');
                 };
 
                 const loadRoots2 = () => {
@@ -3781,6 +4025,11 @@ const browsePageHTML = `<!DOCTYPE html>
                     formatSize, formatDate, getExtension, isAudio, isImage, isVideo, isPlaylist, fullPath, sortIndicator,
                     loadRoots, browse, browseTo, changeSort,
 
+                    // Media view
+                    viewMode, toggleViewMode,
+                    imageEntries, audioEntries, videoEntries, otherEntries,
+                    formatDuration, handleThumbError,
+
                     // Dual pane
                     dualPane, toggleDualPane,
                     pane2Path, pane2Entries, pane2Loading, pane2Error,
@@ -4418,7 +4667,7 @@ func main() {
 		mux.HandleFunc("/browse", browsePageHandler)
 		mux.HandleFunc("/schema", makeSchemaHandler(database))
 		mux.HandleFunc("/api/roots", makeRootsHandler(database))
-		mux.HandleFunc("/api/browse", makeBrowseHandler(database))
+		mux.HandleFunc("/api/browse", makeBrowseHandler(database, q2Dir))
 		mux.HandleFunc("/api/stream", makeStreamHandler(database))
 		mux.HandleFunc("/api/image", makeImageHandler(database))
 		mux.HandleFunc("/api/thumbnail", makeThumbnailHandler(database, q2Dir))

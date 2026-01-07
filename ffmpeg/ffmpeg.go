@@ -413,3 +413,63 @@ func (m *Manager) GenerateThumbnail(ctx context.Context, inputPath, outputPath s
 
 	return nil
 }
+
+// GetVideoDuration returns the duration of a video file in seconds.
+func (m *Manager) GetVideoDuration(ctx context.Context, videoPath string) (float64, error) {
+	ffprobePath, err := m.GetFFprobePath(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	cmd := exec.CommandContext(ctx, ffprobePath,
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		videoPath,
+	)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe duration failed: %w", err)
+	}
+
+	durationStr := strings.TrimSpace(string(output))
+	var duration float64
+	if _, err := fmt.Sscanf(durationStr, "%f", &duration); err != nil {
+		return 0, fmt.Errorf("failed to parse duration '%s': %w", durationStr, err)
+	}
+
+	return duration, nil
+}
+
+// ExtractVideoFrame extracts a single frame from a video at the specified timestamp.
+// The frame is scaled to fit within the bounding box size while maintaining aspect ratio.
+func (m *Manager) ExtractVideoFrame(ctx context.Context, videoPath, outputPath string, timestampSec float64, size int, quality int) error {
+	ffmpegPath, err := m.GetFFmpegPath(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Format timestamp as HH:MM:SS.mmm
+	timestamp := fmt.Sprintf("%.3f", timestampSec)
+
+	// Scale filter: fit within bounding box, maintain aspect ratio
+	scaleFilter := fmt.Sprintf("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease", size, size)
+
+	cmd := exec.CommandContext(ctx, ffmpegPath,
+		"-ss", timestamp,        // Seek to timestamp (before -i for faster seeking)
+		"-i", videoPath,
+		"-vframes", "1",         // Extract only 1 frame
+		"-vf", scaleFilter,
+		"-qscale:v", fmt.Sprintf("%d", quality),
+		"-y",                    // Overwrite output
+		outputPath,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg frame extraction failed: %w: %s", err, string(output))
+	}
+
+	return nil
+}

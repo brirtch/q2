@@ -817,7 +817,7 @@ func TestBrowseHandler_ValidPath(t *testing.T) {
 		t.Fatalf("Failed to create file: %v", err)
 	}
 
-	handler := makeBrowseHandler(database)
+	handler := makeBrowseHandler(database, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+testFolder, nil)
 	w := httptest.NewRecorder()
 
@@ -857,7 +857,7 @@ func TestBrowseHandler_Subdirectory(t *testing.T) {
 		t.Fatalf("Failed to create subdir: %v", err)
 	}
 
-	handler := makeBrowseHandler(database)
+	handler := makeBrowseHandler(database, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+subdir, nil)
 	w := httptest.NewRecorder()
 
@@ -892,7 +892,7 @@ func TestBrowseHandler_PathOutsideRoots(t *testing.T) {
 	// Try to browse a path outside monitored folders
 	outsidePath := filepath.Dir(filepath.Dir(testFolder))
 
-	handler := makeBrowseHandler(database)
+	handler := makeBrowseHandler(database, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+outsidePath, nil)
 	w := httptest.NewRecorder()
 
@@ -924,7 +924,7 @@ func TestBrowseHandler_NonExistentPath(t *testing.T) {
 	// Try to browse a non-existent path within the monitored folder
 	nonExistent := filepath.Join(testFolder, "does-not-exist")
 
-	handler := makeBrowseHandler(database)
+	handler := makeBrowseHandler(database, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+nonExistent, nil)
 	w := httptest.NewRecorder()
 
@@ -950,7 +950,7 @@ func TestBrowseHandler_FileNotDirectory(t *testing.T) {
 		t.Fatalf("Failed to create file: %v", err)
 	}
 
-	handler := makeBrowseHandler(database)
+	handler := makeBrowseHandler(database, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/browse?path="+filePath, nil)
 	w := httptest.NewRecorder()
 
@@ -974,7 +974,7 @@ func TestBrowseHandler_MissingPath(t *testing.T) {
 	database, _, cleanup := setupTestEnv(t)
 	defer cleanup()
 
-	handler := makeBrowseHandler(database)
+	handler := makeBrowseHandler(database, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/browse", nil)
 	w := httptest.NewRecorder()
 
@@ -998,7 +998,7 @@ func TestBrowseHandler_MethodNotAllowed(t *testing.T) {
 	database, _, cleanup := setupTestEnv(t)
 	defer cleanup()
 
-	handler := makeBrowseHandler(database)
+	handler := makeBrowseHandler(database, "")
 	req := httptest.NewRequest(http.MethodPost, "/api/browse?path=/some/path", nil)
 	w := httptest.NewRecorder()
 
