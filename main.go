@@ -2667,6 +2667,8 @@ const browsePageHTML = `<!DOCTYPE html>
         .view-toggle { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 14px; display: flex; align-items: center; gap: 8px; }
         .view-toggle:hover { background: #30363d; border-color: #484f58; }
         .view-toggle.active { background: #1f6feb; border-color: #1f6feb; color: white; }
+        .view-toggle.small { padding: 4px 10px; font-size: 11px; }
+        .pane-actions { display: flex; gap: 8px; margin-left: auto; }
 
         .container { max-width: 1200px; margin: 0 auto; background: #161b22; border-radius: 6px; border: 1px solid #30363d; }
         .panes-wrapper.dual-pane { max-width: 100%; }
@@ -2940,16 +2942,8 @@ const browsePageHTML = `<!DOCTYPE html>
                         <span v-if="metadataStatus.queue_length > 0" class="queue-info">(+{{ metadataStatus.queue_length }} queued)</span>
                     </span>
                 </div>
-                <!-- Refresh Metadata Button -->
-                <button v-if="currentPath" class="refresh-btn" @click="refreshMetadata" :disabled="isCurrentPathQueued">
-                    <span v-if="isCurrentPathScanning" class="spinner"></span>
-                    {{ refreshButtonText }}
-                </button>
                 <button class="view-toggle" :class="{ active: dualPane }" @click="toggleDualPane">
                     {{ dualPane ? '◫ Dual Pane' : '▢ Single Pane' }}
-                </button>
-                <button class="view-toggle" :class="{ active: viewMode === 'media' }" @click="toggleViewMode">
-                    {{ viewMode === 'media' ? '🎨 Media View' : '📋 File View' }}
                 </button>
             </div>
         </div>
@@ -2975,6 +2969,15 @@ const browsePageHTML = `<!DOCTYPE html>
                     <span class="stat"><span class="stat-value">{{ folderCount }}</span> folder{{ folderCount !== 1 ? 's' : '' }}</span>
                     <span class="stat"><span class="stat-value">{{ fileCount }}</span> file{{ fileCount !== 1 ? 's' : '' }}</span>
                     <span class="stat"><span class="stat-value">{{ formatSize(totalSize) }}</span> total</span>
+                    <div class="pane-actions">
+                        <button class="view-toggle small" :class="{ active: viewMode === 'media' }" @click="toggleViewMode">
+                            {{ viewMode === 'media' ? '🎨 Media' : '📋 Files' }}
+                        </button>
+                        <button class="refresh-btn small" @click="refreshMetadata" :disabled="isCurrentPathQueued">
+                            <span v-if="isCurrentPathScanning" class="spinner"></span>
+                            {{ refreshButtonText }}
+                        </button>
+                    </div>
                 </div>
 
                 <!-- Content -->
@@ -3041,7 +3044,7 @@ const browsePageHTML = `<!DOCTYPE html>
                         <div v-if="imageEntries.length" class="media-section">
                             <h3 class="section-header">Images ({{ imageEntries.length }})</h3>
                             <div class="thumbnail-grid">
-                                <div v-for="img in imageEntries" :key="img.name" class="thumb-item" @click="openImage(img)">
+                                <div v-for="img in imageEntries" :key="img.name" class="thumb-item" @click="openImage(img)" @contextmenu.prevent="openAlbumMenu($event, img)">
                                     <img :src="img.thumbnailSmall || '/api/thumbnail?path=' + encodeURIComponent(fullPath(img.name)) + '&size=small'" :alt="img.name" loading="lazy" @error="handleThumbError">
                                     <span class="thumb-name">{{ img.name }}</span>
                                 </div>
@@ -3139,10 +3142,15 @@ const browsePageHTML = `<!DOCTYPE html>
                     <span class="stat"><span class="stat-value">{{ pane2FolderCount }}</span> folder{{ pane2FolderCount !== 1 ? 's' : '' }}</span>
                     <span class="stat"><span class="stat-value">{{ pane2FileCount }}</span> file{{ pane2FileCount !== 1 ? 's' : '' }}</span>
                     <span class="stat"><span class="stat-value">{{ formatSize(pane2TotalSize) }}</span> total</span>
-                    <button class="refresh-btn small" @click="refreshMetadata2" :disabled="isPane2PathQueued">
-                        <span v-if="isPane2PathScanning" class="spinner"></span>
-                        {{ refreshButtonText2 }}
-                    </button>
+                    <div class="pane-actions">
+                        <button class="view-toggle small" :class="{ active: viewMode2 === 'media' }" @click="toggleViewMode2">
+                            {{ viewMode2 === 'media' ? '🎨 Media' : '📋 Files' }}
+                        </button>
+                        <button class="refresh-btn small" @click="refreshMetadata2" :disabled="isPane2PathQueued">
+                            <span v-if="isPane2PathScanning" class="spinner"></span>
+                            {{ refreshButtonText2 }}
+                        </button>
+                    </div>
                 </div>
 
                 <!-- Content -->
@@ -3165,7 +3173,7 @@ const browsePageHTML = `<!DOCTYPE html>
                     </div>
 
                     <!-- File Table -->
-                    <table v-else>
+                    <table v-else-if="viewMode2 === 'file'">
                         <thead>
                             <tr>
                                 <th @click="changeSort2('name')">Name <span class="sort-indicator">{{ sortIndicator2('name') }}</span></th>
@@ -3202,6 +3210,89 @@ const browsePageHTML = `<!DOCTYPE html>
                             </tr>
                         </tbody>
                     </table>
+
+                    <!-- Media View for Pane 2 -->
+                    <div v-else-if="viewMode2 === 'media'" class="media-view">
+                        <!-- Images Section -->
+                        <div v-if="imageEntries2.length" class="media-section">
+                            <h3 class="section-header">Images ({{ imageEntries2.length }})</h3>
+                            <div class="thumbnail-grid">
+                                <div v-for="img in imageEntries2" :key="img.name" class="thumb-item" @click="openImage2(img)" @contextmenu.prevent="openAlbumMenu($event, img, true)">
+                                    <img :src="img.thumbnailSmall || '/api/thumbnail?path=' + encodeURIComponent(pane2FullPath(img.name)) + '&size=small'" :alt="img.name" loading="lazy" @error="handleThumbError">
+                                    <span class="thumb-name">{{ img.name }}</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Audio Section -->
+                        <div v-if="audioEntries2.length" class="media-section">
+                            <h3 class="section-header">Audio ({{ audioEntries2.length }})</h3>
+                            <table class="audio-table">
+                                <thead>
+                                    <tr>
+                                        <th></th>
+                                        <th>Title</th>
+                                        <th>Artist</th>
+                                        <th>Album</th>
+                                        <th>Duration</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="audio in audioEntries2" :key="audio.name" class="audio-row" @dblclick="playNow2(audio)">
+                                        <td class="audio-actions">
+                                            <button class="audio-btn play" @click.stop="playNow2(audio)" title="Play">▶</button>
+                                        </td>
+                                        <td class="audio-title">{{ audio.title || audio.name }}</td>
+                                        <td class="audio-artist">{{ audio.artist || '-' }}</td>
+                                        <td class="audio-album">{{ audio.album || '-' }}</td>
+                                        <td class="audio-duration">{{ audio.duration ? formatDuration(audio.duration) : '-' }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <!-- Videos Section -->
+                        <div v-if="videoEntries2.length" class="media-section">
+                            <h3 class="section-header">Videos ({{ videoEntries2.length }})</h3>
+                            <div class="thumbnail-grid">
+                                <div v-for="vid in videoEntries2" :key="vid.name" class="thumb-item" @click="openVideo2(vid)">
+                                    <img :src="vid.thumbnailSmall || '/api/thumbnail?path=' + encodeURIComponent(pane2FullPath(vid.name)) + '&size=small'" :alt="vid.name" loading="lazy" @error="handleThumbError">
+                                    <span class="thumb-name">{{ vid.name }}</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Other Section -->
+                        <div v-if="otherEntries2.length" class="media-section">
+                            <h3 class="section-header">Other ({{ otherEntries2.length }})</h3>
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Name</th>
+                                        <th>Type</th>
+                                        <th>Size</th>
+                                        <th>Modified</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="entry in otherEntries2" :key="entry.name">
+                                        <td class="name-cell">
+                                            <span class="icon">{{ entry.type === 'dir' ? '📁' : '📄' }}</span>
+                                            <a v-if="entry.type === 'dir'" class="folder-link" @click="browse2(pane2FullPath(entry.name))">{{ entry.name }}</a>
+                                            <span v-else class="file-name">{{ entry.name }}</span>
+                                        </td>
+                                        <td class="type-cell">{{ entry.type === 'dir' ? 'Folder' : getExtension(entry.name) || 'File' }}</td>
+                                        <td class="size-cell">{{ entry.type === 'dir' ? '-' : formatSize(entry.size) }}</td>
+                                        <td class="modified-cell">{{ formatDate(entry.modified) }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div v-if="!imageEntries2.length && !audioEntries2.length && !videoEntries2.length && !otherEntries2.length" class="empty-message">
+                            This folder is empty
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -3492,6 +3583,7 @@ const browsePageHTML = `<!DOCTYPE html>
 
                 // View mode state
                 const viewMode = ref('file'); // 'file' or 'media'
+                const viewMode2 = ref('file'); // 'file' or 'media' for pane 2
 
                 // Audio player state
                 const queue = ref([]);
@@ -3871,6 +3963,12 @@ const browsePageHTML = `<!DOCTYPE html>
                 const videoEntries = computed(() => sortedEntries.value.filter(e => e.type === 'file' && isVideo(e.name)));
                 const otherEntries = computed(() => sortedEntries.value.filter(e => e.type === 'dir' || (!isImage(e.name) && !isAudio(e.name) && !isVideo(e.name))));
 
+                // Pane 2 media view entries
+                const imageEntries2 = computed(() => pane2SortedEntries.value.filter(e => e.type === 'file' && isImage(e.name)));
+                const audioEntries2 = computed(() => pane2SortedEntries.value.filter(e => e.type === 'file' && isAudio(e.name)));
+                const videoEntries2 = computed(() => pane2SortedEntries.value.filter(e => e.type === 'file' && isVideo(e.name)));
+                const otherEntries2 = computed(() => pane2SortedEntries.value.filter(e => e.type === 'dir' || (!isImage(e.name) && !isAudio(e.name) && !isVideo(e.name))));
+
                 // Image list for navigation (filtered to only images)
                 const imageList = computed(() =>
                     sortedEntries.value.filter(e => e.type === 'file' && isImage(e.name))
@@ -4062,6 +4160,34 @@ const browsePageHTML = `<!DOCTYPE html>
                     // Reload with metadata when switching to media view
                     if (viewMode.value === 'media' && currentPath.value) {
                         browseWithMetadata(currentPath.value);
+                    }
+                };
+
+                // Browse with metadata for pane 2
+                const browseWithMetadata2 = async (path) => {
+                    pane2Loading.value = true;
+                    pane2Error.value = null;
+                    try {
+                        const resp = await fetch('/api/browse?path=' + encodeURIComponent(path) + '&metadata=true');
+                        const data = await resp.json();
+                        if (data.error) throw new Error(data.error);
+                        pane2Path.value = data.path;
+                        pane2Entries.value = data.entries;
+                        pane2SortColumn.value = 'name';
+                        pane2SortAsc.value = true;
+                    } catch (e) {
+                        pane2Error.value = 'Failed to load: ' + e.message;
+                    }
+                    pane2Loading.value = false;
+                };
+
+                // View mode toggle for pane 2
+                const toggleViewMode2 = () => {
+                    viewMode2.value = viewMode2.value === 'file' ? 'media' : 'file';
+                    updateUrl();
+                    // Reload with metadata when switching to media view
+                    if (viewMode2.value === 'media' && pane2Path.value) {
+                        browseWithMetadata2(pane2Path.value);
                     }
                 };
 
@@ -5036,6 +5162,9 @@ const browsePageHTML = `<!DOCTYPE html>
                         if (pane2Path.value) {
                             params.set('pane2', pane2Path.value);
                         }
+                        if (viewMode2.value === 'media') {
+                            params.set('view2', 'media');
+                        }
                     }
                     if (viewMode.value === 'media') {
                         params.set('view', 'media');
@@ -5063,6 +5192,10 @@ const browsePageHTML = `<!DOCTYPE html>
                         // Restore dual pane state
                         const dual = params.get('dual');
                         dualPane.value = dual === '1';
+
+                        // Restore pane 2 view mode
+                        const view2 = params.get('view2');
+                        viewMode2.value = view2 === 'media' ? 'media' : 'file';
 
                         // Restore main pane
                         const path = params.get('path');
@@ -5108,8 +5241,9 @@ const browsePageHTML = `<!DOCTYPE html>
                     loadRoots, browse, browseTo, changeSort,
 
                     // Media view
-                    viewMode, toggleViewMode,
+                    viewMode, toggleViewMode, viewMode2, toggleViewMode2,
                     imageEntries, audioEntries, videoEntries, otherEntries,
+                    imageEntries2, audioEntries2, videoEntries2, otherEntries2,
                     formatDuration, handleThumbError,
 
                     // Dual pane
