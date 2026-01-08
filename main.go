@@ -41,7 +41,8 @@ var (
 	metadataRefreshCurrent string
 	metadataRefreshTotal   int
 	metadataRefreshDone    int
-	metadataRefreshQueue   []string // Queue of paths waiting to be refreshed
+	metadataRefreshQueue   []string            // Queue of paths waiting to be refreshed
+	metadataRefreshCancel  context.CancelFunc  // Function to cancel current scan
 )
 
 // MetadataRefreshRequest is the request body for metadata refresh.
@@ -166,8 +167,14 @@ func updateFileThumbnails(database *db.DB, fileID int64, smallPath, largePath st
 		smallPath, largePath, fileID)
 }
 
+// errScanCancelled is returned when a metadata scan is cancelled
+var errScanCancelled = errors.New("scan cancelled")
+
 // refreshMetadata walks a directory and extracts metadata for all audio/image/video files.
 func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *ffmpeg.Manager) {
+	// Create cancellable context
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Set initial state
 	metadataRefreshMu.Lock()
 	metadataRefreshActive = true
@@ -175,11 +182,13 @@ func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *
 	metadataRefreshCurrent = ""
 	metadataRefreshTotal = 0
 	metadataRefreshDone = 0
+	metadataRefreshCancel = cancel
 	metadataRefreshMu.Unlock()
 
 	defer func() {
-		// Check if there are more items in the queue
+		// Clear cancel function and check queue
 		metadataRefreshMu.Lock()
+		metadataRefreshCancel = nil
 		if len(metadataRefreshQueue) > 0 {
 			// Pop the next path from the queue
 			nextPath := metadataRefreshQueue[0]
@@ -193,9 +202,15 @@ func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *
 		}
 	}()
 
-	// First pass: count files
+	// First pass: count files (can be cancelled)
 	var totalFiles int
 	filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			return errScanCancelled
+		default:
+		}
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -205,15 +220,26 @@ func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *
 		return nil
 	})
 
+	// Check if cancelled during count
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
 	metadataRefreshMu.Lock()
 	metadataRefreshTotal = totalFiles
 	metadataRefreshMu.Unlock()
 
-	// Create a context for thumbnail generation
-	ctx := context.Background()
-
 	// Second pass: extract metadata
 	filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			return errScanCancelled
+		default:
+		}
+
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -484,6 +510,36 @@ func makeMetadataQueuePrioritizeHandler() http.HandlerFunc {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Moved to top of queue",
+		})
+	}
+}
+
+// makeMetadataCancelHandler creates a handler for POST /api/metadata/cancel.
+func makeMetadataCancelHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		metadataRefreshMu.Lock()
+		if !metadataRefreshActive {
+			metadataRefreshMu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": false,
+				"message": "No scan in progress",
+			})
+			return
+		}
+
+		if metadataRefreshCancel != nil {
+			metadataRefreshCancel()
+		}
+		metadataRefreshMu.Unlock()
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Scan cancelled",
 		})
 	}
 }
@@ -2341,7 +2397,10 @@ const browsePageHTML = `<!DOCTYPE html>
         .metadata-queue-close:hover { color: #c9d1d9; }
         .metadata-queue-content { max-height: 420px; overflow-y: auto; }
         .metadata-queue-current { padding: 15px; background: #1f6feb22; border-bottom: 1px solid #30363d; }
-        .metadata-queue-current .label { font-size: 11px; color: #58a6ff; text-transform: uppercase; margin-bottom: 5px; }
+        .metadata-queue-current .current-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+        .metadata-queue-current .label { font-size: 11px; color: #58a6ff; text-transform: uppercase; }
+        .metadata-queue-current .cancel-btn { background: #da3633; border: none; color: white; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+        .metadata-queue-current .cancel-btn:hover { background: #f85149; }
         .metadata-queue-current .path { font-size: 13px; color: #c9d1d9; word-break: break-all; }
         .metadata-queue-current .progress { font-size: 12px; color: #8b949e; margin-top: 5px; }
         .metadata-queue-list { padding: 10px 0; }
@@ -2749,7 +2808,10 @@ const browsePageHTML = `<!DOCTYPE html>
             <div class="metadata-queue-content">
                 <!-- Currently scanning -->
                 <div v-if="metadataStatus.scanning" class="metadata-queue-current">
-                    <div class="label">Currently Scanning</div>
+                    <div class="current-header">
+                        <div class="label">Currently Scanning</div>
+                        <button class="cancel-btn" @click="cancelMetadataScan" title="Cancel scan">Cancel</button>
+                    </div>
                     <div class="path">{{ metadataStatus.path }}</div>
                     <div class="progress">{{ metadataStatus.files_done }}/{{ metadataStatus.files_total }} files ({{ metadataProgressPercent }}%)</div>
                 </div>
@@ -3054,6 +3116,21 @@ const browsePageHTML = `<!DOCTYPE html>
                         }
                     } catch (e) {
                         console.error('Failed to prioritize in queue:', e);
+                    }
+                };
+
+                // Cancel current metadata scan
+                const cancelMetadataScan = async () => {
+                    try {
+                        const resp = await fetch('/api/metadata/cancel', {
+                            method: 'POST'
+                        });
+                        if (resp.ok) {
+                            // Refresh status to update display
+                            await checkMetadataStatus();
+                        }
+                    } catch (e) {
+                        console.error('Failed to cancel scan:', e);
                     }
                 };
 
@@ -4350,7 +4427,7 @@ const browsePageHTML = `<!DOCTYPE html>
                     metadataStatus, metadataProgressPercent, refreshMetadata,
                     isCurrentPathScanning, isCurrentPathQueued, refreshButtonText,
                     showMetadataQueuePanel, toggleMetadataQueuePanel,
-                    removeFromMetadataQueue, prioritizeInQueue
+                    removeFromMetadataQueue, prioritizeInQueue, cancelMetadataScan
                 };
             }
         }).mount('#app');
@@ -4978,6 +5055,7 @@ func main() {
 		mux.HandleFunc("/api/metadata/status", makeMetadataStatusHandler())
 		mux.HandleFunc("/api/metadata/queue", makeMetadataQueueRemoveHandler())
 		mux.HandleFunc("/api/metadata/queue/prioritize", makeMetadataQueuePrioritizeHandler())
+		mux.HandleFunc("/api/metadata/cancel", makeMetadataCancelHandler())
 
 		// Wrapper to set cast manager base URL from first request
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
