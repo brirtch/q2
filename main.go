@@ -3395,7 +3395,7 @@ const browsePageHTML = `<!DOCTYPE html>
                 const sortIndicator = (col) => sortColumn.value === col ? (sortAsc.value ? '▲' : '▼') : '';
 
                 // File browser functions
-                const loadRoots = async () => {
+                const loadRoots = async (updateHash = true) => {
                     loading.value = true;
                     error.value = null;
                     currentPath.value = null;
@@ -3404,13 +3404,16 @@ const browsePageHTML = `<!DOCTYPE html>
                         const data = await resp.json();
                         if (data.error) throw new Error(data.error);
                         roots.value = data.roots;
+                        if (updateHash) {
+                            history.pushState(null, '', window.location.pathname);
+                        }
                     } catch (e) {
                         error.value = 'Failed to load: ' + e.message;
                     }
                     loading.value = false;
                 };
 
-                const browse = async (path) => {
+                const browse = async (path, updateHash = true) => {
                     loading.value = true;
                     error.value = null;
                     try {
@@ -3423,6 +3426,9 @@ const browsePageHTML = `<!DOCTYPE html>
                         entries.value = data.entries;
                         sortColumn.value = 'name';
                         sortAsc.value = true;
+                        if (updateHash) {
+                            history.pushState(null, '', '#' + encodeURIComponent(data.path));
+                        }
                     } catch (e) {
                         error.value = 'Failed to load: ' + e.message;
                     }
@@ -4361,15 +4367,29 @@ const browsePageHTML = `<!DOCTYPE html>
                 // Watch crossfade setting
                 watch(crossfadeEnabled, () => saveState());
 
+                // Handle URL hash navigation
+                const navigateFromHash = () => {
+                    const hash = window.location.hash;
+                    if (hash && hash.length > 1) {
+                        const path = decodeURIComponent(hash.substring(1));
+                        browse(path, false);
+                    } else {
+                        loadRoots(false);
+                    }
+                };
+
                 // Lifecycle
                 onMounted(() => {
                     loadState();
                     // Apply mute state to audio elements
                     if (audioA.value) audioA.value.muted = isMuted.value;
                     if (audioB.value) audioB.value.muted = isMuted.value;
-                    loadRoots();
+                    // Navigate based on URL hash (or load roots if no hash)
+                    navigateFromHash();
                     // Add keyboard listener for image viewer
                     document.addEventListener('keydown', handleKeydown);
+                    // Handle browser back/forward buttons
+                    window.addEventListener('popstate', navigateFromHash);
                 });
 
                 return {
