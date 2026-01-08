@@ -3395,7 +3395,7 @@ const browsePageHTML = `<!DOCTYPE html>
                 const sortIndicator = (col) => sortColumn.value === col ? (sortAsc.value ? '▲' : '▼') : '';
 
                 // File browser functions
-                const loadRoots = async (updateHash = true) => {
+                const loadRoots = async (doUpdateUrl = true) => {
                     loading.value = true;
                     error.value = null;
                     currentPath.value = null;
@@ -3404,8 +3404,8 @@ const browsePageHTML = `<!DOCTYPE html>
                         const data = await resp.json();
                         if (data.error) throw new Error(data.error);
                         roots.value = data.roots;
-                        if (updateHash) {
-                            history.pushState(null, '', window.location.pathname);
+                        if (doUpdateUrl) {
+                            updateUrl();
                         }
                     } catch (e) {
                         error.value = 'Failed to load: ' + e.message;
@@ -3413,7 +3413,7 @@ const browsePageHTML = `<!DOCTYPE html>
                     loading.value = false;
                 };
 
-                const browse = async (path, updateHash = true) => {
+                const browse = async (path, doUpdateUrl = true) => {
                     loading.value = true;
                     error.value = null;
                     try {
@@ -3426,8 +3426,8 @@ const browsePageHTML = `<!DOCTYPE html>
                         entries.value = data.entries;
                         sortColumn.value = 'name';
                         sortAsc.value = true;
-                        if (updateHash) {
-                            history.pushState(null, '', '#' + encodeURIComponent(data.path));
+                        if (doUpdateUrl) {
+                            updateUrl();
                         }
                     } catch (e) {
                         error.value = 'Failed to load: ' + e.message;
@@ -3475,11 +3475,13 @@ const browsePageHTML = `<!DOCTYPE html>
                 // Dual pane toggle and functions
                 const toggleDualPane = () => {
                     dualPane.value = !dualPane.value;
+                    updateUrl();
                 };
 
                 // View mode toggle
                 const toggleViewMode = () => {
                     viewMode.value = viewMode.value === 'file' ? 'media' : 'file';
+                    updateUrl();
                     // Reload with metadata when switching to media view
                     if (viewMode.value === 'media' && currentPath.value) {
                         browseWithMetadata(currentPath.value);
@@ -3499,13 +3501,16 @@ const browsePageHTML = `<!DOCTYPE html>
                     e.target.src = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100"><rect fill="%2321262d" width="100" height="100"/><text x="50" y="55" text-anchor="middle" fill="%236e7681" font-size="12">No Preview</text></svg>');
                 };
 
-                const loadRoots2 = () => {
+                const loadRoots2 = (doUpdateUrl = true) => {
                     pane2Path.value = null;
                     pane2Entries.value = [];
                     pane2Error.value = null;
+                    if (doUpdateUrl) {
+                        updateUrl();
+                    }
                 };
 
-                const browse2 = async (path) => {
+                const browse2 = async (path, doUpdateUrl = true) => {
                     pane2Loading.value = true;
                     pane2Error.value = null;
                     try {
@@ -3516,6 +3521,9 @@ const browsePageHTML = `<!DOCTYPE html>
                         pane2Entries.value = data.entries;
                         pane2SortColumn.value = 'name';
                         pane2SortAsc.value = true;
+                        if (doUpdateUrl) {
+                            updateUrl();
+                        }
                     } catch (e) {
                         pane2Error.value = 'Failed to load: ' + e.message;
                     }
@@ -4369,12 +4377,62 @@ const browsePageHTML = `<!DOCTYPE html>
                 // Watch crossfade setting
                 watch(crossfadeEnabled, () => saveState());
 
+                // Build URL hash from current state
+                const buildUrlHash = () => {
+                    const params = new URLSearchParams();
+                    if (currentPath.value) {
+                        params.set('path', currentPath.value);
+                    }
+                    if (dualPane.value) {
+                        params.set('dual', '1');
+                        if (pane2Path.value) {
+                            params.set('pane2', pane2Path.value);
+                        }
+                    }
+                    if (viewMode.value === 'media') {
+                        params.set('view', 'media');
+                    }
+                    const hashStr = params.toString();
+                    return hashStr ? '#' + hashStr : window.location.pathname;
+                };
+
+                // Update URL with current state
+                const updateUrl = () => {
+                    const newUrl = buildUrlHash();
+                    history.pushState(null, '', newUrl);
+                };
+
                 // Handle URL hash navigation
-                const navigateFromHash = () => {
+                const navigateFromHash = async () => {
                     const hash = window.location.hash;
                     if (hash && hash.length > 1) {
-                        const path = decodeURIComponent(hash.substring(1));
-                        browse(path, false);
+                        const params = new URLSearchParams(hash.substring(1));
+
+                        // Restore view mode
+                        const view = params.get('view');
+                        viewMode.value = view === 'media' ? 'media' : 'file';
+
+                        // Restore dual pane state
+                        const dual = params.get('dual');
+                        dualPane.value = dual === '1';
+
+                        // Restore main pane
+                        const path = params.get('path');
+                        if (path) {
+                            await browse(path, false);
+                        } else {
+                            await loadRoots(false);
+                        }
+
+                        // Restore pane 2 if dual pane
+                        if (dualPane.value) {
+                            const pane2 = params.get('pane2');
+                            if (pane2) {
+                                await browse2(pane2, false);
+                            } else {
+                                loadRoots2();
+                            }
+                        }
                     } else {
                         loadRoots(false);
                     }
