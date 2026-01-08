@@ -2943,7 +2943,7 @@ const browsePageHTML = `<!DOCTYPE html>
                     </span>
                 </div>
                 <button class="view-toggle" :class="{ active: dualPane }" @click="toggleDualPane">
-                    {{ dualPane ? '◫ Dual Pane' : '▢ Single Pane' }}
+                    {{ dualPane ? '▢ Single Pane' : '◫ Dual Pane' }}
                 </button>
             </div>
         </div>
@@ -2971,7 +2971,7 @@ const browsePageHTML = `<!DOCTYPE html>
                     <span class="stat"><span class="stat-value">{{ formatSize(totalSize) }}</span> total</span>
                     <div class="pane-actions">
                         <button class="view-toggle small" :class="{ active: viewMode === 'media' }" @click="toggleViewMode">
-                            {{ viewMode === 'media' ? '🎨 Media' : '📋 Files' }}
+                            {{ viewMode === 'media' ? '📋 Files' : '🎨 Media' }}
                         </button>
                         <button class="refresh-btn small" @click="refreshMetadata" :disabled="isCurrentPathQueued">
                             <span v-if="isCurrentPathScanning" class="spinner"></span>
@@ -3144,7 +3144,7 @@ const browsePageHTML = `<!DOCTYPE html>
                     <span class="stat"><span class="stat-value">{{ formatSize(pane2TotalSize) }}</span> total</span>
                     <div class="pane-actions">
                         <button class="view-toggle small" :class="{ active: viewMode2 === 'media' }" @click="toggleViewMode2">
-                            {{ viewMode2 === 'media' ? '🎨 Media' : '📋 Files' }}
+                            {{ viewMode2 === 'media' ? '📋 Files' : '🎨 Media' }}
                         </button>
                         <button class="refresh-btn small" @click="refreshMetadata2" :disabled="isPane2PathQueued">
                             <span v-if="isPane2PathScanning" class="spinner"></span>
