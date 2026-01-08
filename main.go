@@ -3457,7 +3457,8 @@ const browsePageHTML = `<!DOCTYPE html>
                     const sep = currentPath.value.includes('\\') ? '\\' : '/';
                     let path = parts.join(sep);
                     if (currentPath.value.match(/^[a-zA-Z]:/)) {
-                        path = parts[0] + (parts.length > 1 ? sep + parts.slice(1).join(sep) : '');
+                        // For Windows paths, ensure drive root has trailing separator (P:\ not P:)
+                        path = parts[0] + sep + (parts.length > 1 ? parts.slice(1).join(sep) : '');
                     }
                     browse(path);
                 };
@@ -3525,7 +3526,8 @@ const browsePageHTML = `<!DOCTYPE html>
                     const sep = pane2Path.value.includes('\\') ? '\\' : '/';
                     let path = parts.join(sep);
                     if (pane2Path.value.match(/^[a-zA-Z]:/)) {
-                        path = parts[0] + (parts.length > 1 ? sep + parts.slice(1).join(sep) : '');
+                        // For Windows paths, ensure drive root has trailing separator (P:\ not P:)
+                        path = parts[0] + sep + (parts.length > 1 ? parts.slice(1).join(sep) : '');
                     }
                     browse2(path);
                 };
