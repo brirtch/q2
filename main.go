@@ -577,6 +577,13 @@ const homePageHTML = `<!DOCTYPE html>
                     <p>Navigate through monitored folders and view files</p>
                 </div>
             </a>
+            <a href="/albums" class="nav-card">
+                <span class="icon">🖼️</span>
+                <div class="info">
+                    <h2>./albums</h2>
+                    <p>View and manage photo albums</p>
+                </div>
+            </a>
             <a href="/schema" class="nav-card">
                 <span class="icon">📊</span>
                 <div class="info">
@@ -1354,6 +1361,73 @@ type PlaylistReorderRequest struct {
 	ToIndex   int    `json:"to_index"`
 }
 
+// Album represents a photo album stored in the database.
+type Album struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	CoverPath string `json:"cover_path,omitempty"`
+	ItemCount int    `json:"item_count"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+// AlbumItem represents an image in an album.
+type AlbumItem struct {
+	ID             int64  `json:"id"`
+	FileID         int64  `json:"file_id"`
+	Position       int    `json:"position"`
+	Path           string `json:"path"`
+	Filename       string `json:"filename"`
+	ThumbnailSmall string `json:"thumbnail_small,omitempty"`
+	ThumbnailLarge string `json:"thumbnail_large,omitempty"`
+}
+
+// AlbumWithContains adds a contains flag for checking if an image is in the album.
+type AlbumWithContains struct {
+	Album
+	Contains bool `json:"contains"`
+}
+
+// AlbumsResponse is the response for listing albums.
+type AlbumsResponse struct {
+	Albums []Album `json:"albums"`
+}
+
+// AlbumResponse is the response for reading an album.
+type AlbumResponse struct {
+	Album Album       `json:"album"`
+	Items []AlbumItem `json:"items"`
+}
+
+// AlbumCheckResponse is the response for checking which albums contain an image.
+type AlbumCheckResponse struct {
+	Albums []AlbumWithContains `json:"albums"`
+}
+
+// AlbumCreateRequest is the request body for creating an album.
+type AlbumCreateRequest struct {
+	Name string `json:"name"`
+}
+
+// AlbumAddRequest is the request body for adding an image to an album.
+type AlbumAddRequest struct {
+	AlbumID int64  `json:"album_id"`
+	Path    string `json:"path"`
+}
+
+// AlbumRemoveRequest is the request body for removing an image from an album.
+type AlbumRemoveRequest struct {
+	AlbumID int64 `json:"album_id"`
+	ItemID  int64 `json:"item_id"`
+}
+
+// AlbumReorderRequest is the request body for reordering images in an album.
+type AlbumReorderRequest struct {
+	AlbumID   int64 `json:"album_id"`
+	FromIndex int   `json:"from_index"`
+	ToIndex   int   `json:"to_index"`
+}
+
 // makeCastDevicesHandler creates a handler for /api/cast/devices.
 // Supports ?type=audio to filter for audio-only devices, ?type=video for video devices.
 func makeCastDevicesHandler(castMgr *cast.Manager) http.HandlerFunc {
@@ -2018,6 +2092,414 @@ func makePlaylistCheckHandler(playlistDir string) http.HandlerFunc {
 	}
 }
 
+// makeAlbumsHandler creates a handler for /api/albums (list all albums).
+func makeAlbumsHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		rows, err := database.Query(`
+			SELECT a.id, a.name, a.cover_path, a.created_at, a.updated_at,
+			       (SELECT COUNT(*) FROM album_items WHERE album_id = a.id) as item_count
+			FROM albums a
+			ORDER BY a.name
+		`)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to query albums"})
+			return
+		}
+		defer rows.Close()
+
+		var albums []Album
+		for rows.Next() {
+			var a Album
+			var coverPath, createdAt, updatedAt *string
+			if err := rows.Scan(&a.ID, &a.Name, &coverPath, &createdAt, &updatedAt, &a.ItemCount); err != nil {
+				continue
+			}
+			if coverPath != nil {
+				a.CoverPath = *coverPath
+			}
+			if createdAt != nil {
+				a.CreatedAt = *createdAt
+			}
+			if updatedAt != nil {
+				a.UpdatedAt = *updatedAt
+			}
+			albums = append(albums, a)
+		}
+
+		if albums == nil {
+			albums = []Album{}
+		}
+		writeJSON(w, http.StatusOK, AlbumsResponse{Albums: albums})
+	}
+}
+
+// makeAlbumHandler creates a handler for /api/album (CRUD operations).
+func makeAlbumHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// Read album contents
+			idStr := r.URL.Query().Get("id")
+			if idStr == "" {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "id parameter required"})
+				return
+			}
+
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid id"})
+				return
+			}
+
+			// Get album info
+			var album Album
+			var coverPath, createdAt, updatedAt *string
+			row := database.QueryRow(`
+				SELECT a.id, a.name, a.cover_path, a.created_at, a.updated_at,
+				       (SELECT COUNT(*) FROM album_items WHERE album_id = a.id) as item_count
+				FROM albums a WHERE a.id = ?`, id)
+			if err := row.Scan(&album.ID, &album.Name, &coverPath, &createdAt, &updatedAt, &album.ItemCount); err != nil {
+				writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "album not found"})
+				return
+			}
+			if coverPath != nil {
+				album.CoverPath = *coverPath
+			}
+			if createdAt != nil {
+				album.CreatedAt = *createdAt
+			}
+			if updatedAt != nil {
+				album.UpdatedAt = *updatedAt
+			}
+
+			// Get album items
+			rows, err := database.Query(`
+				SELECT ai.id, ai.file_id, ai.position, f.path, f.filename,
+				       f.thumbnail_small_path, f.thumbnail_large_path
+				FROM album_items ai
+				JOIN files f ON ai.file_id = f.id
+				WHERE ai.album_id = ?
+				ORDER BY ai.position`, id)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to query album items"})
+				return
+			}
+			defer rows.Close()
+
+			var items []AlbumItem
+			for rows.Next() {
+				var item AlbumItem
+				var thumbSmall, thumbLarge *string
+				if err := rows.Scan(&item.ID, &item.FileID, &item.Position, &item.Path, &item.Filename, &thumbSmall, &thumbLarge); err != nil {
+					continue
+				}
+				if thumbSmall != nil && *thumbSmall != "" {
+					item.ThumbnailSmall = "/api/thumbnail?path=" + url.QueryEscape(item.Path) + "&size=small"
+				}
+				if thumbLarge != nil && *thumbLarge != "" {
+					item.ThumbnailLarge = "/api/thumbnail?path=" + url.QueryEscape(item.Path) + "&size=large"
+				}
+				items = append(items, item)
+			}
+
+			if items == nil {
+				items = []AlbumItem{}
+			}
+			writeJSON(w, http.StatusOK, AlbumResponse{Album: album, Items: items})
+
+		case http.MethodPost:
+			// Create new album
+			var req AlbumCreateRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+				return
+			}
+
+			if req.Name == "" {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "name is required"})
+				return
+			}
+
+			result := database.Write(`INSERT INTO albums (name) VALUES (?)`, req.Name)
+			if result.Err != nil {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to create album"})
+				return
+			}
+
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"id":      result.LastInsertID,
+				"name":    req.Name,
+			})
+
+		case http.MethodDelete:
+			// Delete album
+			idStr := r.URL.Query().Get("id")
+			if idStr == "" {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "id parameter required"})
+				return
+			}
+
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid id"})
+				return
+			}
+
+			result := database.Write(`DELETE FROM albums WHERE id = ?`, id)
+			if result.Err != nil {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to delete album"})
+				return
+			}
+
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		}
+	}
+}
+
+// makeAlbumAddHandler creates a handler for /api/album/add.
+func makeAlbumAddHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req AlbumAddRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.AlbumID == 0 || req.Path == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "album_id and path are required"})
+			return
+		}
+
+		// Look up file ID from path
+		normalizedPath := normalizePath(req.Path)
+		var fileID int64
+		row := database.QueryRow(`SELECT id FROM files WHERE path = ?`, normalizedPath)
+		if err := row.Scan(&fileID); err != nil {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "file not found in database"})
+			return
+		}
+
+		// Get max position for this album
+		var maxPos int
+		row = database.QueryRow(`SELECT COALESCE(MAX(position), -1) FROM album_items WHERE album_id = ?`, req.AlbumID)
+		row.Scan(&maxPos)
+
+		// Insert the album item
+		result := database.Write(`
+			INSERT INTO album_items (album_id, file_id, position)
+			VALUES (?, ?, ?)
+			ON CONFLICT(album_id, file_id) DO NOTHING`,
+			req.AlbumID, fileID, maxPos+1)
+		if result.Err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to add to album"})
+			return
+		}
+
+		// Update album's updated_at timestamp
+		database.Write(`UPDATE albums SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, req.AlbumID)
+
+		// Update album cover if not set
+		database.Write(`
+			UPDATE albums SET cover_path = ?
+			WHERE id = ? AND (cover_path IS NULL OR cover_path = '')`,
+			normalizedPath, req.AlbumID)
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	}
+}
+
+// makeAlbumRemoveHandler creates a handler for /api/album/remove.
+func makeAlbumRemoveHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req AlbumRemoveRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.AlbumID == 0 {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "album_id is required"})
+			return
+		}
+
+		result := database.Write(`DELETE FROM album_items WHERE id = ? AND album_id = ?`, req.ItemID, req.AlbumID)
+		if result.Err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to remove from album"})
+			return
+		}
+
+		// Update album's updated_at timestamp
+		database.Write(`UPDATE albums SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, req.AlbumID)
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	}
+}
+
+// makeAlbumReorderHandler creates a handler for /api/album/reorder.
+func makeAlbumReorderHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		var req AlbumReorderRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+
+		if req.AlbumID == 0 {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "album_id is required"})
+			return
+		}
+
+		// Get all items in current order
+		rows, err := database.Query(`
+			SELECT id FROM album_items WHERE album_id = ? ORDER BY position`, req.AlbumID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to read album"})
+			return
+		}
+
+		var itemIDs []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				continue
+			}
+			itemIDs = append(itemIDs, id)
+		}
+		rows.Close()
+
+		if req.FromIndex < 0 || req.FromIndex >= len(itemIDs) ||
+			req.ToIndex < 0 || req.ToIndex >= len(itemIDs) {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid index"})
+			return
+		}
+
+		// Reorder
+		item := itemIDs[req.FromIndex]
+		itemIDs = append(itemIDs[:req.FromIndex], itemIDs[req.FromIndex+1:]...)
+		itemIDs = append(itemIDs[:req.ToIndex], append([]int64{item}, itemIDs[req.ToIndex:]...)...)
+
+		// Update positions
+		for i, id := range itemIDs {
+			database.Write(`UPDATE album_items SET position = ? WHERE id = ?`, i, id)
+		}
+
+		// Update album's updated_at timestamp
+		database.Write(`UPDATE albums SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, req.AlbumID)
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	}
+}
+
+// makeAlbumCheckHandler creates a handler for /api/album/check.
+func makeAlbumCheckHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+
+		imagePath := r.URL.Query().Get("path")
+		if imagePath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path parameter required"})
+			return
+		}
+
+		normalizedPath := normalizePath(imagePath)
+
+		// Get the file ID for this path
+		var fileID int64
+		row := database.QueryRow(`SELECT id FROM files WHERE path = ?`, normalizedPath)
+		if err := row.Scan(&fileID); err != nil {
+			// File not in database - just return all albums with contains=false
+			rows, err := database.Query(`
+				SELECT a.id, a.name, a.cover_path,
+				       (SELECT COUNT(*) FROM album_items WHERE album_id = a.id) as item_count
+				FROM albums a ORDER BY a.name
+			`)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to query albums"})
+				return
+			}
+			defer rows.Close()
+
+			var albums []AlbumWithContains
+			for rows.Next() {
+				var a Album
+				var coverPath *string
+				if err := rows.Scan(&a.ID, &a.Name, &coverPath, &a.ItemCount); err != nil {
+					continue
+				}
+				if coverPath != nil {
+					a.CoverPath = *coverPath
+				}
+				albums = append(albums, AlbumWithContains{Album: a, Contains: false})
+			}
+
+			if albums == nil {
+				albums = []AlbumWithContains{}
+			}
+			writeJSON(w, http.StatusOK, AlbumCheckResponse{Albums: albums})
+			return
+		}
+
+		// Get all albums with contains flag
+		rows, err := database.Query(`
+			SELECT a.id, a.name, a.cover_path,
+			       (SELECT COUNT(*) FROM album_items WHERE album_id = a.id) as item_count,
+			       EXISTS(SELECT 1 FROM album_items WHERE album_id = a.id AND file_id = ?) as contains
+			FROM albums a ORDER BY a.name
+		`, fileID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to query albums"})
+			return
+		}
+		defer rows.Close()
+
+		var albums []AlbumWithContains
+		for rows.Next() {
+			var a Album
+			var coverPath *string
+			var contains bool
+			if err := rows.Scan(&a.ID, &a.Name, &coverPath, &a.ItemCount, &contains); err != nil {
+				continue
+			}
+			if coverPath != nil {
+				a.CoverPath = *coverPath
+			}
+			albums = append(albums, AlbumWithContains{Album: a, Contains: contains})
+		}
+
+		if albums == nil {
+			albums = []AlbumWithContains{}
+		}
+		writeJSON(w, http.StatusOK, AlbumCheckResponse{Albums: albums})
+	}
+}
+
 // enrichEntriesWithMetadata adds metadata to file entries by querying the database.
 func enrichEntriesWithMetadata(database *db.DB, q2Dir string, dirPath string, entries []FileEntry) {
 	for i := range entries {
@@ -2379,6 +2861,8 @@ const browsePageHTML = `<!DOCTYPE html>
         .refresh-btn:hover { background: #2ea043; border-color: #2ea043; }
         .refresh-btn:disabled { opacity: 0.6; cursor: not-allowed; }
         .refresh-btn .spinner { width: 14px; height: 14px; border: 2px solid transparent; border-top-color: white; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        .refresh-btn.small { padding: 4px 10px; font-size: 11px; margin-left: auto; }
+        .refresh-btn.small .spinner { width: 12px; height: 12px; }
         @keyframes spin { to { transform: rotate(360deg); } }
         .metadata-progress { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #8b949e; display: flex; align-items: center; gap: 10px; }
         .metadata-progress .progress-bar { width: 100px; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
@@ -2534,6 +3018,9 @@ const browsePageHTML = `<!DOCTYPE html>
                                     <span v-else-if="isImage(entry.name)" class="file-name image-file" @click="openImage(entry)">{{ entry.name }}</span>
                                     <span v-else-if="isVideo(entry.name)" class="file-name video-file" @click="openVideo(entry)">{{ entry.name }}</span>
                                     <span v-else class="file-name">{{ entry.name }}</span>
+                                    <div v-if="isImage(entry.name)" class="audio-controls">
+                                        <button class="audio-btn" @click.stop="openAlbumMenu($event, entry)" title="Add to album">📁</button>
+                                    </div>
                                     <div v-if="isAudio(entry.name)" class="audio-controls">
                                         <button class="audio-btn play" @click.stop="playNow(entry)" title="Play now">▶</button>
                                         <button class="audio-btn" @click.stop="addToQueueTop(entry)" title="Add to top of queue">⬆Q</button>
@@ -2652,6 +3139,10 @@ const browsePageHTML = `<!DOCTYPE html>
                     <span class="stat"><span class="stat-value">{{ pane2FolderCount }}</span> folder{{ pane2FolderCount !== 1 ? 's' : '' }}</span>
                     <span class="stat"><span class="stat-value">{{ pane2FileCount }}</span> file{{ pane2FileCount !== 1 ? 's' : '' }}</span>
                     <span class="stat"><span class="stat-value">{{ formatSize(pane2TotalSize) }}</span> total</span>
+                    <button class="refresh-btn small" @click="refreshMetadata2" :disabled="isPane2PathQueued">
+                        <span v-if="isPane2PathScanning" class="spinner"></span>
+                        {{ refreshButtonText2 }}
+                    </button>
                 </div>
 
                 <!-- Content -->
@@ -2695,6 +3186,9 @@ const browsePageHTML = `<!DOCTYPE html>
                                     <span v-else-if="isImage(entry.name)" class="file-name image-file" @click="openImage2(entry)">{{ entry.name }}</span>
                                     <span v-else-if="isVideo(entry.name)" class="file-name video-file" @click="openVideo2(entry)">{{ entry.name }}</span>
                                     <span v-else class="file-name">{{ entry.name }}</span>
+                                    <div v-if="isImage(entry.name)" class="audio-controls">
+                                        <button class="audio-btn" @click.stop="openAlbumMenu($event, entry, true)" title="Add to album">📁</button>
+                                    </div>
                                     <div v-if="isAudio(entry.name)" class="audio-controls">
                                         <button class="audio-btn play" @click.stop="playNow2(entry)" title="Play now">▶</button>
                                         <button class="audio-btn" @click.stop="addToQueueTop2(entry)" title="Add to top of queue">⬆Q</button>
@@ -2730,6 +3224,28 @@ const browsePageHTML = `<!DOCTYPE html>
                 </div>
                 <div class="playlist-popup-new" @click="createNewPlaylist">
                     + Create new playlist...
+                </div>
+            </div>
+        </div>
+
+        <!-- Album Popup Menu -->
+        <div class="playlist-popup" :class="{ hidden: !showAlbumMenu }" :style="albumMenuStyle">
+            <div class="playlist-popup-header">
+                <span>Add to Album</span>
+                <button @click="closeAlbumMenu">×</button>
+            </div>
+            <div class="playlist-popup-list">
+                <div v-for="album in availableAlbums" :key="album.id"
+                     class="playlist-popup-item"
+                     @click="addToAlbum(album.id)">
+                    {{ album.name }} ({{ album.item_count }})
+                    <span v-if="album.contains" class="already-here">(already here)</span>
+                </div>
+                <div v-if="availableAlbums.length === 0" class="playlist-popup-empty">
+                    No albums yet
+                </div>
+                <div class="playlist-popup-new" @click="createNewAlbum">
+                    + Create new album...
                 </div>
             </div>
         </div>
@@ -3042,6 +3558,31 @@ const browsePageHTML = `<!DOCTYPE html>
                     return 'Refresh Metadata';
                 });
 
+                // Pane 2 metadata scanning state
+                const isPane2PathScanning = computed(() => {
+                    return metadataStatus.value.scanning && metadataStatus.value.path === pane2Path.value;
+                });
+
+                const pane2PathQueuePosition = computed(() => {
+                    if (!pane2Path.value || !metadataStatus.value.queue) return 0;
+                    const idx = metadataStatus.value.queue.indexOf(pane2Path.value);
+                    return idx >= 0 ? idx + 1 : 0;
+                });
+
+                const isPane2PathQueued = computed(() => {
+                    return isPane2PathScanning.value || pane2PathQueuePosition.value > 0;
+                });
+
+                const refreshButtonText2 = computed(() => {
+                    if (isPane2PathScanning.value) {
+                        return 'Scanning...';
+                    }
+                    if (pane2PathQueuePosition.value > 0) {
+                        return '#' + pane2PathQueuePosition.value + ' in queue';
+                    }
+                    return 'Refresh Metadata';
+                });
+
                 // Check metadata status
                 const checkMetadataStatus = async () => {
                     try {
@@ -3066,6 +3607,29 @@ const browsePageHTML = `<!DOCTYPE html>
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ path: currentPath.value })
+                        });
+                        const data = await resp.json();
+                        if (data.success) {
+                            // Start polling for status
+                            metadataStatus.value.scanning = true;
+                            if (!metadataStatusInterval) {
+                                metadataStatusInterval = setInterval(checkMetadataStatus, 500);
+                            }
+                        } else if (data.error) {
+                            console.error('Metadata refresh error:', data.error);
+                        }
+                    } catch (e) {
+                        console.error('Failed to refresh metadata:', e);
+                    }
+                };
+
+                const refreshMetadata2 = async () => {
+                    if (!pane2Path.value) return;
+                    try {
+                        const resp = await fetch('/api/metadata/refresh', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ path: pane2Path.value })
                         });
                         const data = await resp.json();
                         if (data.success) {
@@ -3239,6 +3803,14 @@ const browsePageHTML = `<!DOCTYPE html>
                 const viewingPlaylist = ref(null);
                 const playlistSongs = ref([]);
 
+                // Album state
+                const showAlbumMenu = ref(false);
+                const albumMenuX = ref(0);
+                const albumMenuY = ref(0);
+                const albumMenuImage = ref(null);
+                const albumMenuPane2 = ref(false);
+                const availableAlbums = ref([]);
+
                 // Audio elements
                 const audioA = ref(null);
                 const audioB = ref(null);
@@ -3385,6 +3957,11 @@ const browsePageHTML = `<!DOCTYPE html>
                 const playlistMenuStyle = computed(() => ({
                     top: playlistMenuY.value + 'px',
                     left: playlistMenuX.value + 'px'
+                }));
+
+                const albumMenuStyle = computed(() => ({
+                    top: albumMenuY.value + 'px',
+                    left: albumMenuX.value + 'px'
                 }));
 
                 const fullPath = (name) => {
@@ -4249,6 +4826,77 @@ const browsePageHTML = `<!DOCTYPE html>
                     }
                 };
 
+                // Album functions
+                const openAlbumMenu = async (event, entry, isPane2 = false) => {
+                    const imagePath = isPane2 ? pane2FullPath(entry.name) : fullPath(entry.name);
+                    albumMenuImage.value = { path: imagePath, name: entry.name };
+                    albumMenuPane2.value = isPane2;
+
+                    // Position popup near button
+                    const rect = event.target.getBoundingClientRect();
+                    albumMenuX.value = Math.min(rect.left, window.innerWidth - 250);
+                    albumMenuY.value = rect.bottom + 5;
+
+                    // Fetch albums with contains info
+                    try {
+                        const resp = await fetch('/api/album/check?path=' + encodeURIComponent(imagePath));
+                        const data = await resp.json();
+                        availableAlbums.value = data.albums || [];
+                    } catch (e) {
+                        console.error('Failed to load albums:', e);
+                        availableAlbums.value = [];
+                    }
+
+                    showAlbumMenu.value = true;
+                };
+
+                const closeAlbumMenu = () => {
+                    showAlbumMenu.value = false;
+                    albumMenuImage.value = null;
+                };
+
+                const addToAlbum = async (albumId) => {
+                    if (!albumMenuImage.value) return;
+
+                    try {
+                        await fetch('/api/album/add', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                album_id: albumId,
+                                path: albumMenuImage.value.path
+                            })
+                        });
+                    } catch (e) {
+                        console.error('Failed to add to album:', e);
+                    }
+
+                    closeAlbumMenu();
+                };
+
+                const createNewAlbum = async () => {
+                    const name = prompt('Enter album name:');
+                    if (!name) return;
+
+                    try {
+                        const createResp = await fetch('/api/album', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name })
+                        });
+                        const createData = await createResp.json();
+
+                        if (createData.success && albumMenuImage.value) {
+                            await addToAlbum(createData.id);
+                        } else {
+                            closeAlbumMenu();
+                        }
+                    } catch (e) {
+                        console.error('Failed to create album:', e);
+                        closeAlbumMenu();
+                    }
+                };
+
                 const openPlaylist = async (entry) => {
                     const path = fullPath(entry.name);
                     try {
@@ -4503,9 +5151,14 @@ const browsePageHTML = `<!DOCTYPE html>
                     playAllFromPlaylist, shuffleAndPlayPlaylist, playSongFromPlaylist,
                     movePlaylistSongUp, movePlaylistSongDown, removeFromPlaylist, deletePlaylist,
 
+                    // Albums
+                    showAlbumMenu, albumMenuStyle, availableAlbums,
+                    openAlbumMenu, closeAlbumMenu, addToAlbum, createNewAlbum,
+
                     // Metadata refresh
-                    metadataStatus, metadataProgressPercent, refreshMetadata,
+                    metadataStatus, metadataProgressPercent, refreshMetadata, refreshMetadata2,
                     isCurrentPathScanning, isCurrentPathQueued, refreshButtonText,
+                    isPane2PathScanning, isPane2PathQueued, refreshButtonText2,
                     showMetadataQueuePanel, toggleMetadataQueuePanel,
                     removeFromMetadataQueue, prioritizeInQueue, cancelMetadataScan
                 };
@@ -4519,6 +5172,285 @@ const browsePageHTML = `<!DOCTYPE html>
 func browsePageHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(browsePageHTML))
+}
+
+// albumsPageHTML is the HTML for the albums page.
+const albumsPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Albums - Q2</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace; background: #0d1117; color: #c9d1d9; min-height: 100vh; }
+
+        .header { background: #161b22; border-bottom: 1px solid #30363d; padding: 15px 20px; display: flex; align-items: center; gap: 15px; }
+        .header a { color: #58a6ff; text-decoration: none; font-size: 14px; }
+        .header a:hover { text-decoration: underline; }
+        .header h1 { color: #c9d1d9; font-size: 18px; flex: 1; }
+        .header .actions { display: flex; gap: 10px; }
+        .btn { background: #238636; border: none; color: white; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: inherit; }
+        .btn:hover { background: #2ea043; }
+        .btn.secondary { background: #30363d; }
+        .btn.secondary:hover { background: #484f58; }
+        .btn.danger { background: #da3633; }
+        .btn.danger:hover { background: #f85149; }
+
+        .content { padding: 20px; max-width: 1400px; margin: 0 auto; }
+
+        .albums-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 20px; }
+        .album-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; cursor: pointer; transition: border-color 0.2s, transform 0.2s; }
+        .album-card:hover { border-color: #58a6ff; transform: translateY(-2px); }
+        .album-cover { width: 100%; aspect-ratio: 1; background: #21262d; display: flex; align-items: center; justify-content: center; }
+        .album-cover img { width: 100%; height: 100%; object-fit: cover; }
+        .album-cover .placeholder { font-size: 48px; opacity: 0.5; }
+        .album-info { padding: 12px; }
+        .album-info h3 { font-size: 14px; color: #c9d1d9; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .album-info .count { font-size: 12px; color: #8b949e; }
+
+        .empty-state { text-align: center; padding: 60px 20px; color: #8b949e; }
+        .empty-state h2 { margin-bottom: 10px; font-size: 20px; }
+        .empty-state p { margin-bottom: 20px; }
+
+        /* Album viewer overlay */
+        .album-viewer { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #0d1117; z-index: 100; display: flex; flex-direction: column; }
+        .album-viewer.hidden { display: none; }
+        .album-viewer-header { background: #161b22; border-bottom: 1px solid #30363d; padding: 15px 20px; display: flex; align-items: center; gap: 15px; }
+        .album-viewer-header h2 { flex: 1; font-size: 18px; color: #c9d1d9; }
+        .album-viewer-content { flex: 1; overflow-y: auto; padding: 20px; }
+        .album-items-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 15px; }
+        .album-item { position: relative; aspect-ratio: 1; background: #21262d; border-radius: 6px; overflow: hidden; cursor: pointer; }
+        .album-item img { width: 100%; height: 100%; object-fit: cover; }
+        .album-item:hover .item-overlay { opacity: 1; }
+        .item-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; gap: 10px; opacity: 0; transition: opacity 0.2s; }
+        .item-overlay button { background: rgba(255,255,255,0.2); border: none; color: white; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; font-size: 16px; }
+        .item-overlay button:hover { background: rgba(255,255,255,0.3); }
+        .item-overlay button.danger:hover { background: #da3633; }
+
+        .album-empty { text-align: center; padding: 60px; color: #8b949e; }
+
+        /* Image viewer */
+        .image-viewer { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.95); z-index: 200; display: flex; align-items: center; justify-content: center; }
+        .image-viewer.hidden { display: none; }
+        .image-viewer img { max-width: 95%; max-height: 95%; object-fit: contain; }
+        .image-viewer .close-btn { position: absolute; top: 20px; right: 20px; background: rgba(255,255,255,0.2); border: none; color: white; width: 40px; height: 40px; border-radius: 50%; cursor: pointer; font-size: 20px; }
+        .image-viewer .close-btn:hover { background: rgba(255,255,255,0.3); }
+        .image-viewer .nav-btn { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.2); border: none; color: white; width: 50px; height: 50px; border-radius: 50%; cursor: pointer; font-size: 24px; }
+        .image-viewer .nav-btn:hover { background: rgba(255,255,255,0.3); }
+        .image-viewer .nav-btn.prev { left: 20px; }
+        .image-viewer .nav-btn.next { right: 20px; }
+        .image-viewer .nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div class="header">
+            <a href="/">&larr; Home</a>
+            <h1>Albums</h1>
+            <div class="actions">
+                <button class="btn" @click="createAlbum">+ New Album</button>
+            </div>
+        </div>
+
+        <div class="content">
+            <div v-if="loading" style="text-align: center; padding: 40px; color: #8b949e;">Loading...</div>
+
+            <div v-else-if="albums.length === 0" class="empty-state">
+                <h2>No albums yet</h2>
+                <p>Create your first album to start organizing your photos.</p>
+                <button class="btn" @click="createAlbum">+ Create Album</button>
+            </div>
+
+            <div v-else class="albums-grid">
+                <div v-for="album in albums" :key="album.id" class="album-card" @click="openAlbum(album)">
+                    <div class="album-cover">
+                        <img v-if="album.cover_path" :src="'/api/thumbnail?path=' + encodeURIComponent(album.cover_path) + '&size=small'" @error="$event.target.style.display='none'">
+                        <span v-else class="placeholder">🖼️</span>
+                    </div>
+                    <div class="album-info">
+                        <h3>{{ album.name }}</h3>
+                        <span class="count">{{ album.item_count }} {{ album.item_count === 1 ? 'photo' : 'photos' }}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Album viewer overlay -->
+        <div class="album-viewer" :class="{ hidden: !viewingAlbum }">
+            <div class="album-viewer-header">
+                <button class="btn secondary" @click="closeAlbum">&larr; Back</button>
+                <h2>{{ viewingAlbum?.name }}</h2>
+                <span style="color: #8b949e; font-size: 13px;">{{ albumItems.length }} photos</span>
+                <div style="flex: 1;"></div>
+                <button class="btn danger" @click="deleteAlbum">Delete Album</button>
+            </div>
+            <div class="album-viewer-content">
+                <div v-if="albumItems.length === 0" class="album-empty">
+                    <p>This album is empty.</p>
+                    <p style="font-size: 13px; margin-top: 10px;">Add photos from the Browse page using the album button on image files.</p>
+                </div>
+                <div v-else class="album-items-grid">
+                    <div v-for="(item, index) in albumItems" :key="item.id" class="album-item" @click="viewImage(index)">
+                        <img :src="item.thumbnail_small || '/api/thumbnail?path=' + encodeURIComponent(item.path) + '&size=small'" @error="handleThumbError">
+                        <div class="item-overlay">
+                            <button @click.stop="removeItem(item)" class="danger" title="Remove from album">🗑️</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Image viewer -->
+        <div class="image-viewer" :class="{ hidden: viewingImageIndex === null }" @click="closeImage">
+            <button class="close-btn" @click.stop="closeImage">&times;</button>
+            <button class="nav-btn prev" @click.stop="prevImage" :disabled="viewingImageIndex === 0">&larr;</button>
+            <img v-if="viewingImageIndex !== null && albumItems[viewingImageIndex]"
+                 :src="albumItems[viewingImageIndex].thumbnail_large || '/api/file?path=' + encodeURIComponent(albumItems[viewingImageIndex].path)"
+                 @click.stop>
+            <button class="nav-btn next" @click.stop="nextImage" :disabled="viewingImageIndex === albumItems.length - 1">&rarr;</button>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted } = Vue;
+
+        createApp({
+            setup() {
+                const loading = ref(true);
+                const albums = ref([]);
+                const viewingAlbum = ref(null);
+                const albumItems = ref([]);
+                const viewingImageIndex = ref(null);
+
+                const loadAlbums = async () => {
+                    try {
+                        const resp = await fetch('/api/albums');
+                        const data = await resp.json();
+                        albums.value = data.albums || [];
+                    } catch (e) {
+                        console.error('Failed to load albums:', e);
+                    }
+                    loading.value = false;
+                };
+
+                const createAlbum = async () => {
+                    const name = prompt('Album name:');
+                    if (!name) return;
+
+                    try {
+                        await fetch('/api/album', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name })
+                        });
+                        loadAlbums();
+                    } catch (e) {
+                        console.error('Failed to create album:', e);
+                    }
+                };
+
+                const openAlbum = async (album) => {
+                    viewingAlbum.value = album;
+                    try {
+                        const resp = await fetch('/api/album?id=' + album.id);
+                        const data = await resp.json();
+                        albumItems.value = data.items || [];
+                    } catch (e) {
+                        console.error('Failed to load album:', e);
+                    }
+                };
+
+                const closeAlbum = () => {
+                    viewingAlbum.value = null;
+                    albumItems.value = [];
+                    loadAlbums();
+                };
+
+                const deleteAlbum = async () => {
+                    if (!viewingAlbum.value) return;
+                    if (!confirm('Delete album "' + viewingAlbum.value.name + '"? Photos will not be deleted.')) return;
+
+                    try {
+                        await fetch('/api/album?id=' + viewingAlbum.value.id, { method: 'DELETE' });
+                        closeAlbum();
+                    } catch (e) {
+                        console.error('Failed to delete album:', e);
+                    }
+                };
+
+                const removeItem = async (item) => {
+                    if (!viewingAlbum.value) return;
+
+                    try {
+                        await fetch('/api/album/remove', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ album_id: viewingAlbum.value.id, item_id: item.id })
+                        });
+                        openAlbum(viewingAlbum.value);
+                    } catch (e) {
+                        console.error('Failed to remove item:', e);
+                    }
+                };
+
+                const viewImage = (index) => {
+                    viewingImageIndex.value = index;
+                };
+
+                const closeImage = () => {
+                    viewingImageIndex.value = null;
+                };
+
+                const prevImage = () => {
+                    if (viewingImageIndex.value > 0) {
+                        viewingImageIndex.value--;
+                    }
+                };
+
+                const nextImage = () => {
+                    if (viewingImageIndex.value < albumItems.value.length - 1) {
+                        viewingImageIndex.value++;
+                    }
+                };
+
+                const handleThumbError = (e) => {
+                    e.target.src = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100"><rect fill="%2321262d" width="100" height="100"/><text x="50" y="55" text-anchor="middle" fill="%236e7681" font-size="12">No Preview</text></svg>');
+                };
+
+                // Keyboard navigation
+                const handleKeydown = (e) => {
+                    if (viewingImageIndex.value !== null) {
+                        if (e.key === 'Escape') closeImage();
+                        if (e.key === 'ArrowLeft') prevImage();
+                        if (e.key === 'ArrowRight') nextImage();
+                    } else if (viewingAlbum.value) {
+                        if (e.key === 'Escape') closeAlbum();
+                    }
+                };
+
+                onMounted(() => {
+                    loadAlbums();
+                    document.addEventListener('keydown', handleKeydown);
+                });
+
+                return {
+                    loading, albums, viewingAlbum, albumItems, viewingImageIndex,
+                    loadAlbums, createAlbum, openAlbum, closeAlbum, deleteAlbum,
+                    removeItem, viewImage, closeImage, prevImage, nextImage,
+                    handleThumbError
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>`
+
+// albumsPageHandler serves the albums page.
+func albumsPageHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(albumsPageHTML))
 }
 
 // ColumnInfo holds information about a table column.
@@ -5102,6 +6034,7 @@ func main() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", homeEndpoint)
 		mux.HandleFunc("/browse", browsePageHandler)
+		mux.HandleFunc("/albums", albumsPageHandler)
 		mux.HandleFunc("/schema", makeSchemaHandler(database))
 		mux.HandleFunc("/api/roots", makeRootsHandler(database))
 		mux.HandleFunc("/api/browse", makeBrowseHandler(database, q2Dir))
@@ -5129,6 +6062,14 @@ func main() {
 		mux.HandleFunc("/api/playlist/remove", makePlaylistRemoveHandler(playlistDir))
 		mux.HandleFunc("/api/playlist/reorder", makePlaylistReorderHandler(playlistDir))
 		mux.HandleFunc("/api/playlist/check", makePlaylistCheckHandler(playlistDir))
+
+		// Album endpoints
+		mux.HandleFunc("/api/albums", makeAlbumsHandler(database))
+		mux.HandleFunc("/api/album", makeAlbumHandler(database))
+		mux.HandleFunc("/api/album/add", makeAlbumAddHandler(database))
+		mux.HandleFunc("/api/album/remove", makeAlbumRemoveHandler(database))
+		mux.HandleFunc("/api/album/reorder", makeAlbumReorderHandler(database))
+		mux.HandleFunc("/api/album/check", makeAlbumCheckHandler(database))
 
 		// Metadata refresh endpoints
 		mux.HandleFunc("/api/metadata/refresh", makeMetadataRefreshHandler(database, q2Dir, ffmpegMgr))
