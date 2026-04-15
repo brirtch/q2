@@ -5967,6 +5967,133 @@ func makeMusicSongsHandler(database *db.DB) http.HandlerFunc {
 	}
 }
 
+// makeFavouritesHandler handles GET /api/favourites?type=<type> and POST /api/favourites/toggle.
+func makeFavouritesHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		favType := r.URL.Query().Get("type")
+		switch r.Method {
+		case http.MethodGet:
+			// Return all favourite keys for the given type
+			rows, err := database.Query(`SELECT key FROM favourites WHERE type = ? ORDER BY created_at DESC`, favType)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "database error"})
+				return
+			}
+			defer rows.Close()
+			var keys []string
+			for rows.Next() {
+				var k string
+				if rows.Scan(&k) == nil {
+					keys = append(keys, k)
+				}
+			}
+			if keys == nil {
+				keys = []string{}
+			}
+			writeJSON(w, http.StatusOK, map[string][]string{"keys": keys})
+
+		case http.MethodPost:
+			// Toggle a favourite; body: {"type":"artist","key":"The Beatles"}
+			var req struct {
+				Type string `json:"type"`
+				Key  string `json:"key"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Type == "" || req.Key == "" {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "type and key required"})
+				return
+			}
+			// Try to delete; if nothing deleted, insert
+			res := database.Write(`DELETE FROM favourites WHERE type = ? AND key = ?`, req.Type, req.Key)
+			if res.Err != nil {
+				writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "database error"})
+				return
+			}
+			favourited := false
+			if res.RowsAffected == 0 {
+				database.Write(`INSERT INTO favourites (type, key) VALUES (?, ?)`, req.Type, req.Key)
+				favourited = true
+			}
+			writeJSON(w, http.StatusOK, map[string]bool{"favourited": favourited})
+
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		}
+	}
+}
+
+// makeRecordPlayHandler records a song play in play_history.
+func makeRecordPlayHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+		filePath := r.URL.Query().Get("path")
+		if filePath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "path required"})
+			return
+		}
+		var fileID int64
+		if err := database.QueryRow(`SELECT id FROM files WHERE path = ?`, filePath).Scan(&fileID); err != nil {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "file not found"})
+			return
+		}
+		database.Write(`INSERT INTO play_history (file_id) VALUES (?)`, fileID)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	}
+}
+
+// makeTopSongsHandler returns the most played songs in the last 3 months.
+func makeTopSongsHandler(database *db.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+		rows, err := database.Query(`
+			SELECT f.path, f.filename,
+			       COALESCE(am.title, f.filename) as title,
+			       COALESCE(am.artist, '') as artist,
+			       COALESCE(am.album, '') as album,
+			       COALESCE(am.duration_seconds, 0) as duration,
+			       COUNT(ph.id) as play_count
+			FROM play_history ph
+			JOIN files f ON f.id = ph.file_id
+			LEFT JOIN audio_metadata am ON am.file_id = ph.file_id
+			WHERE ph.played_at >= datetime('now', '-3 months')
+			GROUP BY ph.file_id
+			ORDER BY play_count DESC
+			LIMIT 50
+		`)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "database error"})
+			return
+		}
+		defer rows.Close()
+
+		type TopSong struct {
+			Path      string `json:"path"`
+			Filename  string `json:"filename"`
+			Title     string `json:"title"`
+			Artist    string `json:"artist"`
+			Album     string `json:"album"`
+			Duration  int    `json:"duration"`
+			PlayCount int    `json:"play_count"`
+		}
+		var songs []TopSong
+		for rows.Next() {
+			var s TopSong
+			if err := rows.Scan(&s.Path, &s.Filename, &s.Title, &s.Artist, &s.Album, &s.Duration, &s.PlayCount); err == nil {
+				songs = append(songs, s)
+			}
+		}
+		if songs == nil {
+			songs = []TopSong{}
+		}
+		writeJSON(w, http.StatusOK, songs)
+	}
+}
+
 // LyricsResponse is the JSON response for /api/lyrics.
 type LyricsResponse struct {
 	SyncedLyrics string `json:"synced_lyrics"`
@@ -6243,6 +6370,17 @@ const musicPageHTML = `<!DOCTYPE html>
         .search-box input { width: 100%; padding: 10px 14px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-family: inherit; font-size: 14px; outline: none; }
         .search-box input:focus { border-color: #58a6ff; }
         .search-box input::placeholder { color: #6e7681; }
+
+        /* Favourites filter */
+        .fav-filter { display: flex; gap: 8px; padding: 10px 20px; background: #161b22; border-bottom: 1px solid #21262d; }
+        .fav-filter-btn { background: none; border: 1px solid #30363d; color: #8b949e; padding: 4px 14px; border-radius: 20px; cursor: pointer; font-family: inherit; font-size: 13px; }
+        .fav-filter-btn:hover { border-color: #58a6ff; color: #c9d1d9; }
+        .fav-filter-btn.active { background: #1f6feb22; border-color: #58a6ff; color: #58a6ff; }
+
+        /* Star button */
+        .star-btn { background: none; border: none; cursor: pointer; font-size: 18px; padding: 0 4px; line-height: 1; color: #484f58; transition: color 0.15s, transform 0.15s; flex-shrink: 0; }
+        .star-btn:hover { color: #e3b341; transform: scale(1.2); }
+        .star-btn.favourited { color: #e3b341; }
     </style>
 </head>
 <body>
@@ -6264,19 +6402,25 @@ const musicPageHTML = `<!DOCTYPE html>
         <input type="text" v-model="searchQuery" placeholder="Search music..." @input="onSearch">
     </div>
 
+    <div class="fav-filter" v-if="tab === 'artists' || tab === 'albums' || tab === 'genres' || tab === 'songs'">
+        <button class="fav-filter-btn" :class="{ active: !showFavsOnly }" @click="showFavsOnly = false">All</button>
+        <button class="fav-filter-btn" :class="{ active: showFavsOnly }" @click="showFavsOnly = true">&#11088; Favourites</button>
+    </div>
+
     <div class="content">
         <!-- Artists Tab -->
         <div v-if="tab === 'artists' && !selectedArtist">
-            <div v-if="filteredArtists.length === 0" class="empty-state">
-                <h2>No artists found</h2>
-                <p>Add music folders and run a metadata refresh from the Browse page.</p>
+            <div v-if="visibleArtists.length === 0" class="empty-state">
+                <h2>{{ showFavsOnly ? 'No favourite artists' : 'No artists found' }}</h2>
+                <p v-if="!showFavsOnly">Add music folders and run a metadata refresh from the Browse page.</p>
             </div>
-            <div v-for="a in filteredArtists" :key="a.name" class="list-item" @click="selectArtist(a.name)">
+            <div v-for="a in visibleArtists" :key="a.name" class="list-item" @click="selectArtist(a.name)">
                 <span class="icon">👤</span>
                 <div class="info">
                     <div class="name">{{ a.name }}</div>
                 </div>
                 <span class="count">{{ a.song_count }} {{ a.song_count === 1 ? 'song' : 'songs' }}</span>
+                <button class="star-btn" :class="{ favourited: isFav('artist', a.name) }" @click.stop="toggleFav('artist', a.name)" :title="isFav('artist', a.name) ? 'Remove from favourites' : 'Add to favourites'">{{ isFav('artist', a.name) ? '★' : '☆' }}</button>
             </div>
         </div>
 
@@ -6314,17 +6458,18 @@ const musicPageHTML = `<!DOCTYPE html>
 
         <!-- Albums Tab -->
         <div v-if="tab === 'albums' && !selectedAlbum">
-            <div v-if="filteredAlbums.length === 0" class="empty-state">
-                <h2>No albums found</h2>
-                <p>Add music folders and run a metadata refresh from the Browse page.</p>
+            <div v-if="visibleAlbums.length === 0" class="empty-state">
+                <h2>{{ showFavsOnly ? 'No favourite albums' : 'No albums found' }}</h2>
+                <p v-if="!showFavsOnly">Add music folders and run a metadata refresh from the Browse page.</p>
             </div>
-            <div v-for="a in filteredAlbums" :key="a.name + '|' + a.artist" class="list-item" @click="selectAlbum(a)">
+            <div v-for="a in visibleAlbums" :key="a.name + '|' + a.artist" class="list-item" @click="selectAlbum(a)">
                 <span class="icon">💿</span>
                 <div class="info">
                     <div class="name">{{ a.name }}</div>
                     <div class="detail">{{ a.artist }}{{ a.year ? ' \u2022 ' + a.year : '' }}</div>
                 </div>
                 <span class="count">{{ a.song_count }} {{ a.song_count === 1 ? 'song' : 'songs' }}</span>
+                <button class="star-btn" :class="{ favourited: isFav('album', a.artist + '|' + a.name) }" @click.stop="toggleFav('album', a.artist + '|' + a.name)" :title="isFav('album', a.artist + '|' + a.name) ? 'Remove from favourites' : 'Add to favourites'">{{ isFav('album', a.artist + '|' + a.name) ? '★' : '☆' }}</button>
             </div>
         </div>
 
@@ -6363,16 +6508,17 @@ const musicPageHTML = `<!DOCTYPE html>
 
         <!-- Genres Tab -->
         <div v-if="tab === 'genres' && !selectedGenre">
-            <div v-if="filteredGenres.length === 0" class="empty-state">
-                <h2>No genres found</h2>
-                <p>Add music folders and run a metadata refresh from the Browse page.</p>
+            <div v-if="visibleGenres.length === 0" class="empty-state">
+                <h2>{{ showFavsOnly ? 'No favourite genres' : 'No genres found' }}</h2>
+                <p v-if="!showFavsOnly">Add music folders and run a metadata refresh from the Browse page.</p>
             </div>
-            <div v-for="g in filteredGenres" :key="g.name" class="list-item" @click="selectGenre(g.name)">
+            <div v-for="g in visibleGenres" :key="g.name" class="list-item" @click="selectGenre(g.name)">
                 <span class="icon">🎵</span>
                 <div class="info">
                     <div class="name">{{ g.name }}</div>
                 </div>
                 <span class="count">{{ g.song_count }} {{ g.song_count === 1 ? 'song' : 'songs' }}</span>
+                <button class="star-btn" :class="{ favourited: isFav('genre', g.name) }" @click.stop="toggleFav('genre', g.name)" :title="isFav('genre', g.name) ? 'Remove from favourites' : 'Add to favourites'">{{ isFav('genre', g.name) ? '★' : '☆' }}</button>
             </div>
         </div>
 
@@ -6412,15 +6558,15 @@ const musicPageHTML = `<!DOCTYPE html>
 
         <!-- Songs Tab (all songs) -->
         <div v-if="tab === 'songs'">
-            <div v-if="filteredSongs.length === 0" class="empty-state">
-                <h2>No songs found</h2>
-                <p>Add music folders and run a metadata refresh from the Browse page.</p>
+            <div v-if="visibleSongs.length === 0" class="empty-state">
+                <h2>{{ showFavsOnly ? 'No favourite songs' : 'No songs found' }}</h2>
+                <p v-if="!showFavsOnly">Add music folders and run a metadata refresh from the Browse page.</p>
             </div>
-            <div class="sub-header" v-if="filteredSongs.length > 0">
-                <h2>All Songs ({{ filteredSongs.length }})</h2>
+            <div class="sub-header" v-if="visibleSongs.length > 0">
+                <h2>{{ showFavsOnly ? 'Favourite Songs' : 'All Songs' }} ({{ visibleSongs.length }})</h2>
                 <button class="play-all" @click="playAllSongs">&#9654; Play All</button>
             </div>
-            <table class="song-table" v-if="filteredSongs.length > 0">
+            <table class="song-table" v-if="visibleSongs.length > 0">
                 <thead><tr>
                     <th class="track-num">#</th>
                     <th>Title</th>
@@ -6430,13 +6576,14 @@ const musicPageHTML = `<!DOCTYPE html>
                     <th class="actions-col"></th>
                 </tr></thead>
                 <tbody>
-                    <tr v-for="(s, i) in filteredSongs" :key="s.path" :class="{ playing: isCurrentSong(s) }" @click="playSong(s, i)">
+                    <tr v-for="(s, i) in visibleSongs" :key="s.path" :class="{ playing: isCurrentSong(s) }" @click="playSong(s, i)">
                         <td class="track-num">{{ i + 1 }}</td>
                         <td class="title-col"><span class="song-title">{{ s.title || s.filename }}</span></td>
                         <td class="artist-col">{{ s.artist }}</td>
                         <td class="album-col">{{ s.album }}</td>
                         <td class="duration-col">{{ formatDuration(s.duration) }}</td>
                         <td class="actions-col"><div class="action-btns">
+                            <button class="star-btn" :class="{ favourited: isFav('song', s.path) }" @click.stop="toggleFav('song', s.path)" style="font-size:16px;">{{ isFav('song', s.path) ? '★' : '☆' }}</button>
                             <button class="action-btn play-btn" @click.stop="playSongNow(s)" title="Play now">&#9654;</button>
                             <button class="action-btn" @click.stop="addToQueueTop(s)" title="Add to top of queue">&#11014;Q</button>
                             <button class="action-btn" @click.stop="addToQueueBottom(s)" title="Add to bottom of queue">Q&#11015;</button>
@@ -6449,10 +6596,15 @@ const musicPageHTML = `<!DOCTYPE html>
 
         <!-- Playlists Tab -->
         <div v-if="tab === 'playlists' && !selectedPlaylist">
-            <div v-if="playlists.length === 0" class="empty-state">
-                <h2>No playlists yet</h2>
-                <p>Create playlists from the Browse page or by clicking ··· on any song.</p>
+            <!-- Smart playlist: Most Played -->
+            <div class="list-item" style="border-left: 3px solid #58a6ff;" @click="selectSmartPlaylist('top')">
+                <span class="icon">&#11088;</span>
+                <div class="info">
+                    <div class="name" style="color:#58a6ff;">Most Played — Last 3 Months</div>
+                    <div class="detail">Auto-generated</div>
+                </div>
             </div>
+            <div v-if="playlists.length === 0" style="padding: 12px 16px; color: #484f58; font-size: 13px;">No saved playlists yet</div>
             <div v-for="pl in playlists" :key="pl.path" class="list-item" @click="selectPlaylist(pl)">
                 <span class="icon">&#9654;</span>
                 <div class="info">
@@ -6475,13 +6627,20 @@ const musicPageHTML = `<!DOCTYPE html>
                 <thead><tr>
                     <th class="track-num">#</th>
                     <th>Title</th>
+                    <th v-if="selectedPlaylist.smart">Artist</th>
+                    <th v-if="selectedPlaylist.smart" style="width:60px;text-align:right;">Plays</th>
                     <th class="duration-col">Time</th>
                     <th class="actions-col"></th>
                 </tr></thead>
                 <tbody>
                     <tr v-for="(s, i) in playlistSongs" :key="s.path" @click="playPlaylistSong(s, i)">
                         <td class="track-num">{{ i + 1 }}</td>
-                        <td class="title-col"><span class="song-title">{{ s.title }}</span></td>
+                        <td class="title-col">
+                            <span class="song-title">{{ s.title }}</span>
+                            <div v-if="!selectedPlaylist.smart" style="font-size:11px;color:#8b949e;">{{ s.artist }}</div>
+                        </td>
+                        <td v-if="selectedPlaylist.smart" class="artist-col">{{ s.artist }}</td>
+                        <td v-if="selectedPlaylist.smart" style="text-align:right;color:#8b949e;font-size:12px;">{{ s.play_count }}</td>
                         <td class="duration-col">{{ formatDuration(s.duration) }}</td>
                         <td class="actions-col"><div class="action-btns">
                             <button class="action-btn play-btn" @click.stop="playSongNow(s)" title="Play now">&#9654;</button>
@@ -6661,6 +6820,8 @@ createApp({
         const selectedPlaylist = ref(null);
         const playlistSongs = ref([]);
         const searchQuery = ref('');
+        const showFavsOnly = ref(false);
+        const favourites = ref({}); // { 'artist|name': true, 'song|path': true, ... }
 
         // Player state
         const queue = ref([]);
@@ -6733,6 +6894,39 @@ createApp({
             matchesSearch(s.title || s.filename) || matchesSearch(s.artist) || matchesSearch(s.album)
         ));
 
+        // Favourites helpers
+        const favKey = (type, key) => type + '|' + key;
+        const isFav = (type, key) => !!favourites.value[favKey(type, key)];
+        const toggleFav = async (type, key) => {
+            const resp = await fetch('/api/favourites', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type, key }),
+            });
+            const data = await resp.json();
+            const k = favKey(type, key);
+            if (data.favourited) favourites.value[k] = true;
+            else delete favourites.value[k];
+            // Trigger reactivity
+            favourites.value = { ...favourites.value };
+        };
+        const loadFavourites = async () => {
+            const types = ['artist', 'album', 'genre', 'song'];
+            const map = {};
+            await Promise.all(types.map(async (type) => {
+                const r = await fetch('/api/favourites?type=' + type);
+                const data = await r.json();
+                (data.keys || []).forEach(k => { map[favKey(type, k)] = true; });
+            }));
+            favourites.value = map;
+        };
+
+        // Visible lists (filtered + favourites filter applied)
+        const visibleArtists = computed(() => showFavsOnly.value ? filteredArtists.value.filter(a => isFav('artist', a.name)) : filteredArtists.value);
+        const visibleAlbums = computed(() => showFavsOnly.value ? filteredAlbums.value.filter(a => isFav('album', a.artist + '|' + a.name)) : filteredAlbums.value);
+        const visibleGenres = computed(() => showFavsOnly.value ? filteredGenres.value.filter(g => isFav('genre', g.name)) : filteredGenres.value);
+        const visibleSongs = computed(() => showFavsOnly.value ? filteredSongs.value.filter(s => isFav('song', s.path)) : filteredSongs.value);
+
         const onSearch = () => {};
 
         const formatDuration = (secs) => {
@@ -6773,18 +6967,30 @@ createApp({
             selectedPlaylist.value = pl;
             const r = await fetch('/api/playlist?path=' + encodeURIComponent(pl.path));
             const data = await r.json();
-            playlistSongs.value = data.songs || [];
+            playlistSongs.value = (data.songs || []).map(s => ({ ...s, filename: s.title }));
         };
+
+        const selectSmartPlaylist = async (type) => {
+            if (type === 'top') {
+                selectedPlaylist.value = { name: 'Most Played — Last 3 Months', smart: true };
+                playlistSongs.value = [];
+                const r = await fetch('/api/music/top');
+                const data = await r.json();
+                playlistSongs.value = (data || []).map(s => ({ ...s, filename: s.title || s.filename }));
+            }
+        };
+
+        const songToQueueItem = (s) => ({ path: s.path, title: s.title || s.filename, filename: s.filename || s.title, artist: s.artist || '', album: s.album || '', duration: s.duration });
 
         const playPlaylist = () => {
             if (!playlistSongs.value.length) return;
-            queue.value = playlistSongs.value.map(s => ({ path: s.path, title: s.title, filename: s.title, duration: s.duration }));
+            queue.value = playlistSongs.value.map(songToQueueItem);
             currentIndex.value = 0;
             startPlayback();
         };
 
         const playPlaylistSong = (s, i) => {
-            queue.value = playlistSongs.value.map(s2 => ({ path: s2.path, title: s2.title, filename: s2.title, duration: s2.duration }));
+            queue.value = playlistSongs.value.map(songToQueueItem);
             currentIndex.value = i;
             startPlayback();
         };
@@ -6954,6 +7160,8 @@ createApp({
             if (!audioEl.value) return;
             audioEl.value.src = '/api/stream?path=' + encodeURIComponent(track.path);
             audioEl.value.play().then(() => { isPlaying.value = true; }).catch(e => console.error(e));
+            // Record the play in history
+            fetch('/api/history/record?path=' + encodeURIComponent(track.path), { method: 'POST' }).catch(() => {});
         };
 
         const togglePlay = () => {
@@ -7229,14 +7437,33 @@ createApp({
             canvas.height = canvas.offsetHeight;
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            const barWidth = (canvas.width / bufLen) * 2.5;
-            let x = 0;
-            for (let i = 0; i < bufLen; i++) {
-                const barHeight = (data[i] / 255) * canvas.height;
-                const hue = (i / bufLen) * 220 + 180; // blue-purple range
-                ctx.fillStyle = 'hsla(' + hue + ', 80%, 60%, 0.85)';
-                ctx.fillRect(x, canvas.height - barHeight, barWidth - 1, barHeight);
-                x += barWidth;
+            // Block style: fixed-width columns with gaps, each split into segments
+            const numBars = 48;
+            const gap = 3;
+            const blockGap = 2;
+            const numBlocks = 12;
+            const barW = (canvas.width - gap * (numBars - 1)) / numBars;
+            const blockH = (canvas.height - blockGap * (numBlocks - 1)) / numBlocks;
+
+            for (let i = 0; i < numBars; i++) {
+                // Average a slice of frequency bins for this bar
+                const start = Math.floor(i / numBars * bufLen);
+                const end = Math.floor((i + 1) / numBars * bufLen);
+                let sum = 0;
+                for (let j = start; j < end; j++) sum += data[j];
+                const avg = end > start ? sum / (end - start) : 0;
+                const filledBlocks = Math.round((avg / 255) * numBlocks);
+
+                const x = i * (barW + gap);
+                for (let b = 0; b < filledBlocks; b++) {
+                    const y = canvas.height - (b + 1) * (blockH + blockGap) + blockGap;
+                    // Colour: green at bottom, yellow in middle, blue-white at top
+                    const t = b / numBlocks;
+                    const hue = t < 0.6 ? 140 - t * 60 : 200 + (t - 0.6) * 100;
+                    const light = 45 + t * 20;
+                    ctx.fillStyle = 'hsl(' + hue + ', 70%, ' + light + '%)';
+                    ctx.fillRect(x, y, barW, blockH);
+                }
             }
         };
 
@@ -7305,6 +7532,8 @@ createApp({
         };
 
         onMounted(() => {
+            loadFavourites();
+
             const hash = window.location.hash.replace('#', '');
             const validTabs = ['artists', 'albums', 'genres', 'songs', 'playlists'];
             if (validTabs.includes(hash)) {
@@ -7313,21 +7542,26 @@ createApp({
                 fetchArtists();
             }
 
-            // Close queue panel when clicking outside it
+            // Close queue panel when clicking outside it (but not when clicking the toggle button itself)
             document.addEventListener('click', (e) => {
                 if (!showQueuePanel.value) return;
                 const panel = document.querySelector('.queue-panel');
-                if (panel && !panel.contains(e.target)) showQueuePanel.value = false;
+                const btn = document.querySelector('[title="Queue"]');
+                if (panel && !panel.contains(e.target) && btn && !btn.contains(e.target)) {
+                    showQueuePanel.value = false;
+                }
             });
         });
 
         return {
             tab, artists, albums, genres, songs, searchQuery, onSearch,
             filteredArtists, filteredAlbums, filteredGenres, filteredSongs,
+            visibleArtists, visibleAlbums, visibleGenres, visibleSongs,
+            showFavsOnly, isFav, toggleFav,
             selectedArtist, selectedAlbum, selectedGenre,
             playlists, selectedPlaylist, playlistSongs,
             switchTab, selectArtist, selectAlbum, selectGenre,
-            selectPlaylist, playPlaylist, playPlaylistSong,
+            selectPlaylist, selectSmartPlaylist, playPlaylist, playPlaylistSong,
             queue, currentIndex, currentTrack, isPlaying, currentTime, audioDuration,
             isMuted, volume, audioEl, progressPercent,
             formatDuration, playSong, playAllSongs, addToQueue,
@@ -8545,6 +8779,9 @@ func main() {
 		mux.HandleFunc("/api/music/albums", makeMusicAlbumsHandler(database))
 		mux.HandleFunc("/api/music/genres", makeMusicGenresHandler(database))
 		mux.HandleFunc("/api/music/songs", makeMusicSongsHandler(database))
+		mux.HandleFunc("/api/music/top", makeTopSongsHandler(database))
+		mux.HandleFunc("/api/history/record", makeRecordPlayHandler(database))
+		mux.HandleFunc("/api/favourites", makeFavouritesHandler(database))
 		mux.HandleFunc("/api/lyrics", makeLyricsHandler(database))
 
 		// Metadata refresh endpoints
