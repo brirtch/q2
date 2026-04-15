@@ -4,13 +4,14 @@ package cast
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/miekg/dns"
 	"github.com/vishen/go-chromecast/application"
-	"github.com/vishen/go-chromecast/dns"
 )
 
 // Device represents a discovered Chromecast device.
@@ -92,37 +93,267 @@ func (m *Manager) SetBaseURL(baseURL string) {
 	m.baseURL = baseURL
 }
 
-// DiscoverDevices searches for Chromecast devices on the network.
+// mdnsEntry accumulates DNS-SD records for a single Chromecast device instance.
+type mdnsEntry struct {
+	hostName string // from SRV Target
+	host     string // resolved IPv4, filled in second pass
+	port     int
+	uuid     string
+	name     string
+	devType  string
+}
+
+func ensureMDNSEntry(m map[string]*mdnsEntry, key string) *mdnsEntry {
+	if _, ok := m[key]; !ok {
+		m[key] = &mdnsEntry{}
+	}
+	return m[key]
+}
+
+// discoverCastDevicesUnicast sends an mDNS PTR query from a random (non-5353) UDP port.
+// Per RFC 6762 §6, devices MUST respond via unicast when the query source port is not 5353,
+// so no multicast group membership is required. This reliably works on Windows where the
+// grandcat/zeroconf library's multicast socket binding often fails due to binding to
+// 224.0.0.0:5353 instead of 0.0.0.0:5353.
+//
+// To cover all subnets (WiFi, Ethernet, etc.), one socket is created per multicast-capable
+// interface, each sending from that interface's IP. Unicast replies come back to each
+// respective socket, which are all read concurrently and fed to a shared channel.
+func discoverCastDevicesUnicast(ctx context.Context) ([]Device, error) {
+	// Build a DNS PTR query for the Chromecast service type.
+	msg := new(dns.Msg)
+	msg.Id = dns.Id()
+	msg.RecursionDesired = false
+	msg.Question = []dns.Question{{
+		Name:   "_googlecast._tcp.local.",
+		Qtype:  dns.TypePTR,
+		Qclass: dns.ClassINET,
+	}}
+	buf, err := msg.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack dns msg: %w", err)
+	}
+
+	mdnsAddr := &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353}
+
+	// Collect all candidate interface IPs. Each gets its own socket so that
+	// unicast replies (which go to the sender's IP:port) are received.
+	type ifSocket struct {
+		conn *net.UDPConn
+	}
+	var sockets []ifSocket
+
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 ||
+			iface.Flags&net.FlagMulticast == 0 ||
+			iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip = ip.To4(); ip == nil {
+				continue
+			}
+			// Bind to this specific interface IP so multicast sends go out the right NIC.
+			c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: ip, Port: 0})
+			if err != nil {
+				continue
+			}
+			if deadline, ok := ctx.Deadline(); ok {
+				c.SetDeadline(deadline)
+			}
+			c.WriteToUDP(buf, mdnsAddr)
+			sockets = append(sockets, ifSocket{c})
+		}
+	}
+
+	// Fallback: if no interface-specific sockets could be created, use a generic one.
+	if len(sockets) == 0 {
+		c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err != nil {
+			return nil, fmt.Errorf("udp listen: %w", err)
+		}
+		if deadline, ok := ctx.Deadline(); ok {
+			c.SetDeadline(deadline)
+		}
+		c.WriteToUDP(buf, mdnsAddr)
+		sockets = append(sockets, ifSocket{c})
+	}
+
+	defer func() {
+		for _, s := range sockets {
+			s.conn.Close()
+		}
+	}()
+
+	// Read DNS responses from all sockets concurrently via a shared channel.
+	type rawPacket struct{ data []byte }
+	pktCh := make(chan rawPacket, 64)
+
+	var wg sync.WaitGroup
+	for _, s := range sockets {
+		wg.Add(1)
+		go func(c *net.UDPConn) {
+			defer wg.Done()
+			rbuf := make([]byte, 65536)
+			for {
+				n, _, err := c.ReadFromUDP(rbuf)
+				if err != nil {
+					return // deadline reached or socket closed
+				}
+				pkt := make([]byte, n)
+				copy(pkt, rbuf[:n])
+				select {
+				case pktCh <- rawPacket{pkt}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(s.conn)
+	}
+	go func() {
+		wg.Wait()
+		close(pktCh)
+	}()
+
+	// sendQuery broadcasts a DNS message on all sockets.
+	sendQuery := func(msg *dns.Msg) {
+		b, err := msg.Pack()
+		if err != nil {
+			return
+		}
+		for _, s := range sockets {
+			s.conn.WriteToUDP(b, mdnsAddr)
+		}
+	}
+
+	// Resend the PTR query every second so devices that missed the first packet
+	// still get a chance to respond.
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sendQuery(msg)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Accumulate DNS records until all readers finish (deadline hit).
+	entries := make(map[string]*mdnsEntry) // instance FQDN → partial info
+	hosts := make(map[string]string)       // hostname FQDN → IPv4
+
+	for pkt := range pktCh {
+		var resp dns.Msg
+		if err := resp.Unpack(pkt.data); err != nil {
+			continue
+		}
+		all := append(append(resp.Answer, resp.Ns...), resp.Extra...)
+		for _, rr := range all {
+			switch r := rr.(type) {
+			case *dns.PTR:
+				if r.Hdr.Name == "_googlecast._tcp.local." {
+					if _, exists := entries[r.Ptr]; !exists {
+						entries[r.Ptr] = &mdnsEntry{}
+						// Send a targeted follow-up query for this instance's SRV+TXT
+						// records so split responses (PTR in one packet, SRV/TXT in another)
+						// are reliably received.
+						followUp := new(dns.Msg)
+						followUp.Id = dns.Id()
+						followUp.RecursionDesired = false
+						followUp.Question = []dns.Question{
+							{Name: r.Ptr, Qtype: dns.TypeSRV, Qclass: dns.ClassINET},
+							{Name: r.Ptr, Qtype: dns.TypeTXT, Qclass: dns.ClassINET},
+						}
+						sendQuery(followUp)
+					}
+				}
+			case *dns.SRV:
+				e := ensureMDNSEntry(entries, r.Hdr.Name)
+				e.hostName = r.Target
+				e.port = int(r.Port)
+			case *dns.TXT:
+				e := ensureMDNSEntry(entries, r.Hdr.Name)
+				for _, txt := range r.Txt {
+					kv := strings.SplitN(txt, "=", 2)
+					if len(kv) != 2 {
+						continue
+					}
+					switch kv[0] {
+					case "id":
+						e.uuid = kv[1]
+					case "fn":
+						e.name = kv[1]
+					case "md":
+						e.devType = kv[1]
+					}
+				}
+			case *dns.A:
+				hosts[r.Hdr.Name] = r.A.String()
+			}
+		}
+	}
+
+	// Resolve hostnames to IPs and build the Device list.
+	const castSuffix = "._googlecast._tcp.local."
+	var devices []Device
+	for instanceFQDN, e := range entries {
+		if e.host == "" && e.hostName != "" {
+			e.host = hosts[e.hostName]
+		}
+		if e.host == "" || e.port == 0 {
+			continue
+		}
+		name := e.name
+		if name == "" {
+			// TXT record fn field missing — extract name from the PTR instance label.
+			name = strings.TrimSuffix(instanceFQDN, castSuffix)
+		}
+		devices = append(devices, Device{
+			UUID:       e.uuid,
+			Name:       name,
+			Host:       e.host,
+			Port:       e.port,
+			DeviceType: e.devType,
+			IsAudio:    isAudioDevice(e.devType),
+		})
+	}
+	return devices, nil
+}
+
+// DiscoverDevices searches for Chromecast devices on the network using unicast mDNS
+// (RFC 6762 §6). This approach is reliable on Windows where zeroconf's multicast
+// socket binding fails.
 func (m *Manager) DiscoverDevices(ctx context.Context, timeout time.Duration) ([]Device, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	entriesChan, err := dns.DiscoverCastDNSEntries(ctx, nil)
+	devices, err := discoverCastDevicesUnicast(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("discovery failed: %w", err)
+		return nil, err
+	}
+
+	newDevicesMap := make(map[string]*Device, len(devices))
+	for i := range devices {
+		newDevicesMap[devices[i].UUID] = &devices[i]
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.devices = newDevicesMap
+	m.mu.Unlock()
 
-	// Clear old devices
-	m.devices = make(map[string]*Device)
-
-	var result []Device
-	for entry := range entriesChan {
-		device := &Device{
-			UUID:       entry.UUID,
-			Name:       entry.DeviceName,
-			Host:       entry.AddrV4.String(),
-			Port:       entry.Port,
-			DeviceType: entry.Device,
-			IsAudio:    isAudioDevice(entry.Device),
-		}
-		m.devices[entry.UUID] = device
-		result = append(result, *device)
-	}
-
-	return result, nil
+	return devices, nil
 }
 
 // GetDevices returns the cached list of discovered devices.

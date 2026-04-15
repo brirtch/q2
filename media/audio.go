@@ -73,9 +73,14 @@ func ExtractAudioMetadata(audioPath string) (*AudioMetadata, error) {
 func SaveAudioMetadata(database *db.DB, fileID int64, meta *AudioMetadata) error {
 	// Check if metadata already exists
 	var existingID int64
-	row := database.QueryRow("SELECT id FROM audio_metadata WHERE file_id = ?", fileID)
-	if err := row.Scan(&existingID); err == nil {
-		// Already exists, skip
+	var existingDuration *int
+	row := database.QueryRow("SELECT id, duration_seconds FROM audio_metadata WHERE file_id = ?", fileID)
+	if err := row.Scan(&existingID, &existingDuration); err == nil {
+		// Already exists - update duration if we now have it but didn't before
+		if existingDuration == nil && meta.DurationSeconds != nil {
+			database.Write("UPDATE audio_metadata SET duration_seconds = ? WHERE id = ?",
+				*meta.DurationSeconds, existingID)
+		}
 		return nil
 	}
 
