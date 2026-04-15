@@ -137,12 +137,15 @@ func upsertFile(database *db.DB, folderID int64, filePath string, info os.FileIn
 	row := database.QueryRow("SELECT id FROM files WHERE path = ?", normalizedPath)
 	if err := row.Scan(&existingID); err == nil {
 		// File exists, update it
-		database.Write(`
+		result := database.Write(`
 			UPDATE files SET
 				filename = ?, extension = ?, mediatype = ?,
 				size = ?, modified_at = ?, indexed_at = CURRENT_TIMESTAMP
 			WHERE id = ?`,
 			filename, ext, mediaType, info.Size(), info.ModTime(), existingID)
+		if result.Err != nil {
+			return 0, result.Err
+		}
 		return existingID, nil
 	}
 
@@ -172,7 +175,25 @@ func updateFileThumbnails(database *db.DB, fileID int64, smallPath, largePath st
 var errScanCancelled = errors.New("scan cancelled")
 
 // refreshMetadata walks a directory and extracts metadata for all audio/image/video files.
+// It processes the given path, then drains the queue iteratively (no recursion).
 func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *ffmpeg.Manager) {
+	for {
+		runOneRefresh(database, rootPath, q2Dir, ffmpegMgr)
+
+		metadataRefreshMu.Lock()
+		if len(metadataRefreshQueue) == 0 {
+			metadataRefreshActive = false
+			metadataRefreshMu.Unlock()
+			return
+		}
+		rootPath = metadataRefreshQueue[0]
+		metadataRefreshQueue = metadataRefreshQueue[1:]
+		metadataRefreshMu.Unlock()
+	}
+}
+
+// runOneRefresh performs a single metadata scan for rootPath.
+func runOneRefresh(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *ffmpeg.Manager) {
 	// Create cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -187,21 +208,43 @@ func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *
 	metadataRefreshMu.Unlock()
 
 	defer func() {
-		// Clear cancel function and check queue
 		metadataRefreshMu.Lock()
 		metadataRefreshCancel = nil
-		if len(metadataRefreshQueue) > 0 {
-			// Pop the next path from the queue
-			nextPath := metadataRefreshQueue[0]
-			metadataRefreshQueue = metadataRefreshQueue[1:]
-			metadataRefreshMu.Unlock()
-			// Process next item (recursive call in same goroutine)
-			refreshMetadata(database, nextPath, q2Dir, ffmpegMgr)
-		} else {
-			metadataRefreshActive = false
-			metadataRefreshMu.Unlock()
-		}
+		metadataRefreshMu.Unlock()
 	}()
+
+	// Cache folder list once — avoids a full table scan per file during the walk.
+	type folderRecord struct {
+		id     int64
+		prefix string // normalised path + separator
+		exact  string // normalised path without separator
+	}
+	var cachedFolders []folderRecord
+	if rows, err := database.Query("SELECT id, path FROM folders ORDER BY LENGTH(path) DESC"); err == nil {
+		for rows.Next() {
+			var id int64
+			var p string
+			if rows.Scan(&id, &p) == nil {
+				norm := normalizePath(p)
+				prefix := norm
+				if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+					prefix += string(filepath.Separator)
+				}
+				cachedFolders = append(cachedFolders, folderRecord{id: id, prefix: prefix, exact: norm})
+			}
+		}
+		rows.Close()
+	}
+
+	folderIDForPath := func(filePath string) (int64, bool) {
+		norm := normalizePath(filePath)
+		for _, f := range cachedFolders {
+			if norm == f.exact || strings.HasPrefix(norm, f.prefix) {
+				return f.id, true
+			}
+		}
+		return 0, false
+	}
 
 	// First pass: count files (can be cancelled)
 	var totalFiles int
@@ -267,9 +310,9 @@ func refreshMetadata(database *db.DB, rootPath string, q2Dir string, ffmpegMgr *
 			return nil
 		}
 
-		// Get folder ID for this file
-		folderID, err := getFolderIDForPath(database, path)
-		if err != nil {
+		// Get folder ID for this file (from cache — no DB query per file)
+		folderID, ok := folderIDForPath(path)
+		if !ok {
 			metadataRefreshMu.Lock()
 			metadataRefreshDone++
 			metadataRefreshMu.Unlock()
@@ -627,7 +670,7 @@ const homePageHTML = `<!DOCTYPE html>
             <a href="/albums" class="nav-card">
                 <span class="icon">🖼️</span>
                 <div class="info">
-                    <h2>Albums</h2>
+                    <h2>Photo Albums</h2>
                     <p>View and manage photo albums</p>
                 </div>
             </a>
@@ -1465,6 +1508,8 @@ type CastVolumeRequest struct {
 type PlaylistSong struct {
 	Path     string `json:"path"`
 	Title    string `json:"title"`
+	Artist   string `json:"artist"`
+	Album    string `json:"album"`
 	Duration int    `json:"duration"` // seconds
 }
 
@@ -1894,8 +1939,42 @@ func makePlaylistsHandler(playlistDir string) http.HandlerFunc {
 	}
 }
 
+// enrichPlaylistSongs fills Artist and Album from the audio_metadata table.
+func enrichPlaylistSongs(database *db.DB, songs []PlaylistSong) {
+	if len(songs) == 0 {
+		return
+	}
+	placeholders := make([]string, len(songs))
+	args := make([]interface{}, len(songs))
+	pathToIdx := make(map[string]int, len(songs))
+	for i, s := range songs {
+		norm := normalizePath(s.Path)
+		placeholders[i] = "?"
+		args[i] = norm
+		pathToIdx[norm] = i
+	}
+	query := `SELECT f.path, COALESCE(am.artist,''), COALESCE(am.album,'')
+		FROM files f
+		LEFT JOIN audio_metadata am ON f.id = am.file_id
+		WHERE f.path IN (` + strings.Join(placeholders, ",") + `)`
+	rows, err := database.Query(query, args...)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p, artist, album string
+		if rows.Scan(&p, &artist, &album) == nil {
+			if i, ok := pathToIdx[p]; ok {
+				songs[i].Artist = artist
+				songs[i].Album = album
+			}
+		}
+	}
+}
+
 // makePlaylistHandler creates a handler for /api/playlist (CRUD operations).
-func makePlaylistHandler(playlistDir string) http.HandlerFunc {
+func makePlaylistHandler(playlistDir string, database *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -1913,7 +1992,7 @@ func makePlaylistHandler(playlistDir string) http.HandlerFunc {
 				return
 			}
 			absPlaylistDir, _ := filepath.Abs(playlistDir)
-			if !strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(absPlaylistDir)) {
+			if !strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(absPlaylistDir)+string(filepath.Separator)) {
 				writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "path outside playlists directory"})
 				return
 			}
@@ -1923,6 +2002,9 @@ func makePlaylistHandler(playlistDir string) http.HandlerFunc {
 				writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "playlist not found"})
 				return
 			}
+
+			// Enrich with artist/album from DB
+			enrichPlaylistSongs(database, songs)
 
 			name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 			writeJSON(w, http.StatusOK, PlaylistResponse{
@@ -1980,7 +2062,7 @@ func makePlaylistHandler(playlistDir string) http.HandlerFunc {
 				return
 			}
 			absPlaylistDir, _ := filepath.Abs(playlistDir)
-			if !strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(absPlaylistDir)) {
+			if !strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(absPlaylistDir)+string(filepath.Separator)) {
 				writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "path outside playlists directory"})
 				return
 			}
@@ -2566,13 +2648,22 @@ func makeAlbumReorderHandler(database *db.DB) http.HandlerFunc {
 		itemIDs = append(itemIDs[:req.FromIndex], itemIDs[req.FromIndex+1:]...)
 		itemIDs = append(itemIDs[:req.ToIndex], append([]int64{item}, itemIDs[req.ToIndex:]...)...)
 
-		// Update positions
+		// Update positions and album timestamp in a single transaction
+		statements := make([]db.Statement, 0, len(itemIDs)+1)
 		for i, id := range itemIDs {
-			database.Write(`UPDATE album_items SET position = ? WHERE id = ?`, i, id)
+			statements = append(statements, db.Statement{
+				Query: `UPDATE album_items SET position = ? WHERE id = ?`,
+				Args:  []interface{}{i, id},
+			})
 		}
-
-		// Update album's updated_at timestamp
-		database.Write(`UPDATE albums SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, req.AlbumID)
+		statements = append(statements, db.Statement{
+			Query: `UPDATE albums SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			Args:  []interface{}{req.AlbumID},
+		})
+		if err := database.WriteTransaction(statements); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "failed to save reorder"})
+			return
+		}
 
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 	}
@@ -2664,17 +2755,16 @@ func makeAlbumCheckHandler(database *db.DB) http.HandlerFunc {
 	}
 }
 
-// enrichEntriesWithMetadata adds metadata to file entries by querying the database.
-func enrichEntriesWithMetadata(database *db.DB, q2Dir string, dirPath string, entries []FileEntry) {
+// enrichEntriesWithMetadata adds metadata to file entries using a single batch query.
+func enrichEntriesWithMetadata(database *db.DB, dirPath string, entries []FileEntry) {
+	// Assign media types and build normalised-path → entry index map.
+	pathToIdx := make(map[string]int, len(entries))
+	var paths []string
 	for i := range entries {
 		entry := &entries[i]
-
-		// Skip directories
 		if entry.Type == "dir" {
 			continue
 		}
-
-		// Determine media type based on extension
 		fullPath := filepath.Join(dirPath, entry.Name)
 		if isImageFile(fullPath) {
 			entry.MediaType = "image"
@@ -2683,42 +2773,65 @@ func enrichEntriesWithMetadata(database *db.DB, q2Dir string, dirPath string, en
 		} else if isVideoFile(fullPath) {
 			entry.MediaType = "video"
 		}
+		norm := normalizePath(fullPath)
+		pathToIdx[norm] = i
+		paths = append(paths, norm)
+	}
 
-		// Query database for file metadata
-		normalizedPath := normalizePath(fullPath)
-		row := database.QueryRow(`
-			SELECT f.id, f.thumbnail_small_path, f.thumbnail_large_path,
-			       am.title, am.artist, am.album, am.duration_seconds
-			FROM files f
-			LEFT JOIN audio_metadata am ON f.id = am.file_id
-			WHERE f.path = ?`, normalizedPath)
+	if len(paths) == 0 {
+		return
+	}
 
-		var fileID int64
+	// Build a single IN-clause query for all file paths.
+	placeholders := make([]string, len(paths))
+	args := make([]interface{}, len(paths))
+	for i, p := range paths {
+		placeholders[i] = "?"
+		args[i] = p
+	}
+	query := `
+		SELECT f.path, f.thumbnail_small_path, f.thumbnail_large_path,
+		       am.title, am.artist, am.album, am.duration_seconds
+		FROM files f
+		LEFT JOIN audio_metadata am ON f.id = am.file_id
+		WHERE f.path IN (` + strings.Join(placeholders, ",") + `)`
+
+	rows, err := database.Query(query, args...)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var normPath string
 		var thumbSmall, thumbLarge, title, artist, album *string
 		var duration *int
-
-		if err := row.Scan(&fileID, &thumbSmall, &thumbLarge, &title, &artist, &album, &duration); err == nil {
-			// Set thumbnail URLs if available
-			if thumbSmall != nil && *thumbSmall != "" {
-				entry.ThumbnailSmall = "/api/thumbnail?path=" + url.QueryEscape(fullPath) + "&size=small"
-			}
-			if thumbLarge != nil && *thumbLarge != "" {
-				entry.ThumbnailLarge = "/api/thumbnail?path=" + url.QueryEscape(fullPath) + "&size=large"
-			}
-
-			// Set audio metadata if available
-			if title != nil {
-				entry.Title = *title
-			}
-			if artist != nil {
-				entry.Artist = *artist
-			}
-			if album != nil {
-				entry.Album = *album
-			}
-			if duration != nil {
-				entry.Duration = *duration
-			}
+		if err := rows.Scan(&normPath, &thumbSmall, &thumbLarge, &title, &artist, &album, &duration); err != nil {
+			continue
+		}
+		i, ok := pathToIdx[normPath]
+		if !ok {
+			continue
+		}
+		entry := &entries[i]
+		fullPath := filepath.Join(dirPath, entry.Name)
+		if thumbSmall != nil && *thumbSmall != "" {
+			entry.ThumbnailSmall = "/api/thumbnail?path=" + url.QueryEscape(fullPath) + "&size=small"
+		}
+		if thumbLarge != nil && *thumbLarge != "" {
+			entry.ThumbnailLarge = "/api/thumbnail?path=" + url.QueryEscape(fullPath) + "&size=large"
+		}
+		if title != nil {
+			entry.Title = *title
+		}
+		if artist != nil {
+			entry.Artist = *artist
+		}
+		if album != nil {
+			entry.Album = *album
+		}
+		if duration != nil {
+			entry.Duration = *duration
 		}
 	}
 }
@@ -2785,7 +2898,7 @@ func makeBrowseHandler(database *db.DB, q2Dir string) http.HandlerFunc {
 
 		// If metadata requested, enrich entries with database info
 		if includeMetadata {
-			enrichEntriesWithMetadata(database, q2Dir, path, entries)
+			enrichEntriesWithMetadata(database, path, entries)
 		}
 
 		// Determine parent path (nil if this is a root folder)
@@ -2812,7 +2925,7 @@ const browsePageHTML = `<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Q2 File Browser</title>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
     <style>
         * { box-sizing: border-box; }
         body { font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", "SF Mono", Consolas, monospace; margin: 0; padding: 20px; padding-bottom: 100px; background: #0d1117; color: #c9d1d9; }
@@ -3012,6 +3125,14 @@ const browsePageHTML = `<!DOCTYPE html>
         .playlist-song:hover { background: #1f2428; }
         .playlist-song .song-num { color: #6e7681; font-size: 12px; min-width: 25px; text-align: right; }
         .playlist-song .song-title { flex: 1; color: #c9d1d9; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .playlist-table { width: 100%; border-collapse: collapse; }
+        .playlist-table th { padding: 6px 10px; text-align: left; color: #8b949e; font-size: 12px; border-bottom: 1px solid #30363d; }
+        .playlist-song td { padding: 6px 10px; border-bottom: 1px solid #21262d; font-size: 13px; }
+        .playlist-song:hover td { background: #1f2428; }
+        .playlist-song .song-num { color: #8b949e; width: 40px; }
+        .playlist-song .song-title { color: #c9d1d9; }
+        .playlist-song .song-artist { color: #8b949e; }
+        .playlist-song .song-album { color: #8b949e; font-style: italic; }
         .playlist-song .song-controls { display: flex; gap: 4px; }
         .playlist-song .song-controls button { background: none; border: 1px solid #30363d; color: #8b949e; width: 28px; height: 28px; border-radius: 4px; cursor: pointer; font-size: 12px; }
         .playlist-song .song-controls button:hover { background: #238636; color: white; border-color: #238636; }
@@ -3519,16 +3640,31 @@ const browsePageHTML = `<!DOCTYPE html>
                     <button @click="deletePlaylist" class="danger">🗑 Delete Playlist</button>
                 </div>
                 <div class="playlist-viewer-list">
-                    <div v-for="(song, i) in playlistSongs" :key="i" class="playlist-song">
-                        <span class="song-num">{{ i + 1 }}</span>
-                        <span class="song-title" :title="song.path">{{ song.title }}</span>
-                        <div class="song-controls">
-                            <button @click="playSongFromPlaylist(i)" title="Play">▶</button>
-                            <button @click="movePlaylistSongUp(i)" :disabled="i === 0" title="Move up">▲</button>
-                            <button @click="movePlaylistSongDown(i)" :disabled="i === playlistSongs.length - 1" title="Move down">▼</button>
-                            <button @click="removeFromPlaylist(i)" title="Remove" class="remove-btn">×</button>
-                        </div>
-                    </div>
+                    <table class="playlist-table">
+                        <thead><tr>
+                            <th style="width:40px">#</th>
+                            <th>Title</th>
+                            <th>Artist</th>
+                            <th>Album</th>
+                            <th style="width:80px"></th>
+                        </tr></thead>
+                        <tbody>
+                        <tr v-for="(song, i) in playlistSongs" :key="i" class="playlist-song">
+                            <td class="song-num">{{ i + 1 }}</td>
+                            <td class="song-title" :title="song.path">{{ song.title }}</td>
+                            <td class="song-artist">{{ song.artist }}</td>
+                            <td class="song-album">{{ song.album }}</td>
+                            <td>
+                                <div class="song-controls">
+                                    <button @click="playSongFromPlaylist(i)" title="Play">▶</button>
+                                    <button @click="movePlaylistSongUp(i)" :disabled="i === 0" title="Move up">▲</button>
+                                    <button @click="movePlaylistSongDown(i)" :disabled="i === playlistSongs.length - 1" title="Move down">▼</button>
+                                    <button @click="removeFromPlaylist(i)" title="Remove" class="remove-btn">×</button>
+                                </div>
+                            </td>
+                        </tr>
+                        </tbody>
+                    </table>
                     <div v-if="playlistSongs.length === 0" class="playlist-empty">
                         This playlist is empty. Add songs using the "..." button next to audio files.
                     </div>
@@ -3728,7 +3864,7 @@ const browsePageHTML = `<!DOCTYPE html>
         const VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogv', 'mov', 'avi', 'mkv', 'm4v'];
         const CROSSFADE_DURATION = 3; // seconds
 
-        const { createApp, ref, computed, watch, onMounted, nextTick } = Vue;
+        const { createApp, ref, computed, watch, onMounted, onUnmounted, nextTick } = Vue;
 
         createApp({
             setup() {
@@ -4058,6 +4194,10 @@ const browsePageHTML = `<!DOCTYPE html>
                 const isVideoCasting = ref(false);
                 const videoCastingTo = ref(null);
                 let videoCastSession = null;
+
+                // Google Cast SDK state (SDK not yet loaded — keep refs for future use)
+                const castAvailable = ref(false);
+                let castContext = null;
 
                 // Playlist state
                 const showPlaylistMenu = ref(false);
@@ -5407,6 +5547,11 @@ const browsePageHTML = `<!DOCTYPE html>
                     window.addEventListener('popstate', navigateFromHash);
                 });
 
+                onUnmounted(() => {
+                    document.removeEventListener('keydown', handleKeydown);
+                    window.removeEventListener('popstate', navigateFromHash);
+                });
+
                 return {
                     // File browser
                     roots, currentPath, entries, loading, error,
@@ -6123,10 +6268,10 @@ func makeLyricsHandler(database *db.DB) http.HandlerFunc {
 			return
 		}
 
-		// Check if lyrics already exist in DB
+		// Check if lyrics already exist in DB (only use cache if we actually have content)
 		var syncedLyrics, plainLyrics string
 		lyricsRow := database.QueryRow(`SELECT COALESCE(synced_lyrics,''), COALESCE(plain_lyrics,'') FROM lyrics WHERE file_id = ?`, fileID)
-		if err := lyricsRow.Scan(&syncedLyrics, &plainLyrics); err == nil {
+		if err := lyricsRow.Scan(&syncedLyrics, &plainLyrics); err == nil && (syncedLyrics != "" || plainLyrics != "") {
 			writeJSON(w, http.StatusOK, LyricsResponse{SyncedLyrics: syncedLyrics, PlainLyrics: plainLyrics})
 			return
 		}
@@ -6139,63 +6284,87 @@ func makeLyricsHandler(database *db.DB) http.HandlerFunc {
 			FROM audio_metadata am
 			WHERE am.file_id = ?`, fileID)
 		if err := metaRow.Scan(&title, &artist, &album, &durationSeconds); err != nil {
-			// No metadata, save empty and return
-			database.Write(`INSERT INTO lyrics (file_id, synced_lyrics, plain_lyrics) VALUES (?, '', '') ON CONFLICT(file_id) DO UPDATE SET synced_lyrics='', plain_lyrics=''`, fileID)
+			// No metadata yet — don't cache, allow retry after metadata is scanned
 			writeJSON(w, http.StatusOK, LyricsResponse{})
 			return
 		}
 
-		// Fetch from lrclib.net
-		lrclibURL := "https://lrclib.net/api/get?" + url.Values{
+		client := &http.Client{Timeout: 10 * time.Second}
+
+		lrclibFetch := func(lrclibURL string) (string, string, bool) {
+			req, err := http.NewRequest(http.MethodGet, lrclibURL, nil)
+			if err != nil {
+				return "", "", false
+			}
+			req.Header.Set("User-Agent", "q2-media-manager/1.0 (https://github.com/brirtch/q2)")
+			resp, err := client.Do(req)
+			if err != nil {
+				return "", "", false
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return "", "", false
+			}
+			var lrclibResp struct {
+				SyncedLyrics string `json:"syncedLyrics"`
+				PlainLyrics  string `json:"plainLyrics"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&lrclibResp); err != nil {
+				return "", "", false
+			}
+			return lrclibResp.SyncedLyrics, lrclibResp.PlainLyrics, true
+		}
+
+		// Try /api/get first (exact match). Include duration only when known.
+		getParams := url.Values{
 			"artist_name": {artist},
 			"track_name":  {title},
 			"album_name":  {album},
-			"duration":    {strconv.Itoa(int(durationSeconds))},
-		}.Encode()
-
-		client := &http.Client{Timeout: 10 * time.Second}
-		req, err := http.NewRequest(http.MethodGet, lrclibURL, nil)
-		if err != nil {
-			database.Write(`INSERT INTO lyrics (file_id, synced_lyrics, plain_lyrics) VALUES (?, '', '') ON CONFLICT(file_id) DO UPDATE SET synced_lyrics='', plain_lyrics=''`, fileID)
-			writeJSON(w, http.StatusOK, LyricsResponse{})
-			return
 		}
-		req.Header.Set("User-Agent", "q2-media-manager/1.0 (https://github.com/brirtch/q2)")
+		if durationSeconds > 0 {
+			getParams.Set("duration", strconv.Itoa(int(durationSeconds)))
+		}
+		synced, plain, ok := lrclibFetch("https://lrclib.net/api/get?" + getParams.Encode())
 
-		resp, err := client.Do(req)
-		if err != nil || resp.StatusCode == http.StatusNotFound {
-			if resp != nil {
-				resp.Body.Close()
+		// Fall back to /api/search when get fails (no duration match, not in catalogue yet, etc.)
+		if !ok || (synced == "" && plain == "") {
+			searchParams := url.Values{
+				"artist_name": {artist},
+				"track_name":  {title},
 			}
-			database.Write(`INSERT INTO lyrics (file_id, synced_lyrics, plain_lyrics) VALUES (?, '', '') ON CONFLICT(file_id) DO UPDATE SET synced_lyrics='', plain_lyrics=''`, fileID)
+			type searchResult struct {
+				SyncedLyrics string `json:"syncedLyrics"`
+				PlainLyrics  string `json:"plainLyrics"`
+			}
+			req, err := http.NewRequest(http.MethodGet, "https://lrclib.net/api/search?"+searchParams.Encode(), nil)
+			if err == nil {
+				req.Header.Set("User-Agent", "q2-media-manager/1.0 (https://github.com/brirtch/q2)")
+				resp, err := client.Do(req)
+				if err == nil && resp.StatusCode == http.StatusOK {
+					var results []searchResult
+					if json.NewDecoder(resp.Body).Decode(&results) == nil && len(results) > 0 {
+						synced = results[0].SyncedLyrics
+						plain = results[0].PlainLyrics
+						ok = true
+					}
+					resp.Body.Close()
+				}
+			}
+		}
+
+		if !ok || (synced == "" && plain == "") {
+			// Don't cache empty results so we retry next time
 			writeJSON(w, http.StatusOK, LyricsResponse{})
 			return
 		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			database.Write(`INSERT INTO lyrics (file_id, synced_lyrics, plain_lyrics) VALUES (?, '', '') ON CONFLICT(file_id) DO UPDATE SET synced_lyrics='', plain_lyrics=''`, fileID)
-			writeJSON(w, http.StatusOK, LyricsResponse{})
-			return
-		}
-
-		var lrclibResp struct {
-			SyncedLyrics string `json:"syncedLyrics"`
-			PlainLyrics  string `json:"plainLyrics"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&lrclibResp); err != nil {
-			database.Write(`INSERT INTO lyrics (file_id, synced_lyrics, plain_lyrics) VALUES (?, '', '') ON CONFLICT(file_id) DO UPDATE SET synced_lyrics='', plain_lyrics=''`, fileID)
-			writeJSON(w, http.StatusOK, LyricsResponse{})
-			return
-		}
-
-		// Save to DB (even if empty, to cache the "no lyrics" result)
+		// Cache successful result only
 		database.Write(`INSERT INTO lyrics (file_id, synced_lyrics, plain_lyrics) VALUES (?, ?, ?) ON CONFLICT(file_id) DO UPDATE SET synced_lyrics=excluded.synced_lyrics, plain_lyrics=excluded.plain_lyrics, fetched_at=CURRENT_TIMESTAMP`,
-			fileID, lrclibResp.SyncedLyrics, lrclibResp.PlainLyrics)
+			fileID, synced, plain)
 
 		writeJSON(w, http.StatusOK, LyricsResponse{
-			SyncedLyrics: lrclibResp.SyncedLyrics,
-			PlainLyrics:  lrclibResp.PlainLyrics,
+			SyncedLyrics: synced,
+			PlainLyrics:  plain,
 		})
 	}
 }
@@ -6804,7 +6973,7 @@ const musicPageHTML = `<!DOCTYPE html>
 </div>
 
 <script>
-const { createApp, ref, computed, watch, onMounted, nextTick } = Vue;
+const { createApp, ref, computed, watch, onMounted, onUnmounted, nextTick } = Vue;
 
 createApp({
     setup() {
@@ -6903,6 +7072,7 @@ createApp({
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ type, key }),
             });
+            if (!resp.ok) return;
             const data = await resp.json();
             const k = favKey(type, key);
             if (data.favourited) favourites.value[k] = true;
@@ -6915,6 +7085,7 @@ createApp({
             const map = {};
             await Promise.all(types.map(async (type) => {
                 const r = await fetch('/api/favourites?type=' + type);
+                if (!r.ok) return;
                 const data = await r.json();
                 (data.keys || []).forEach(k => { map[favKey(type, k)] = true; });
             }));
@@ -6927,8 +7098,6 @@ createApp({
         const visibleGenres = computed(() => showFavsOnly.value ? filteredGenres.value.filter(g => isFav('genre', g.name)) : filteredGenres.value);
         const visibleSongs = computed(() => showFavsOnly.value ? filteredSongs.value.filter(s => isFav('song', s.path)) : filteredSongs.value);
 
-        const onSearch = () => {};
-
         const formatDuration = (secs) => {
             if (!secs || secs <= 0) return '--:--';
             const m = Math.floor(secs / 60);
@@ -6938,15 +7107,18 @@ createApp({
 
         const fetchArtists = async () => {
             const r = await fetch('/api/music/artists');
+            if (!r.ok) return;
             artists.value = await r.json();
         };
         const fetchAlbums = async (artist) => {
             const url = artist ? '/api/music/albums?artist=' + encodeURIComponent(artist) : '/api/music/albums';
             const r = await fetch(url);
+            if (!r.ok) return;
             albums.value = await r.json();
         };
         const fetchGenres = async () => {
             const r = await fetch('/api/music/genres');
+            if (!r.ok) return;
             genres.value = await r.json();
         };
         const fetchSongs = async (params) => {
@@ -6954,11 +7126,13 @@ createApp({
             const q = new URLSearchParams(params || {});
             if (q.toString()) url += '?' + q.toString();
             const r = await fetch(url);
+            if (!r.ok) return;
             songs.value = await r.json();
         };
 
         const fetchPlaylists = async () => {
             const r = await fetch('/api/playlists');
+            if (!r.ok) return;
             const data = await r.json();
             playlists.value = data.playlists || [];
         };
@@ -6966,6 +7140,7 @@ createApp({
         const selectPlaylist = async (pl) => {
             selectedPlaylist.value = pl;
             const r = await fetch('/api/playlist?path=' + encodeURIComponent(pl.path));
+            if (!r.ok) return;
             const data = await r.json();
             playlistSongs.value = (data.songs || []).map(s => ({ ...s, filename: s.title }));
         };
@@ -6975,6 +7150,7 @@ createApp({
                 selectedPlaylist.value = { name: 'Most Played — Last 3 Months', smart: true };
                 playlistSongs.value = [];
                 const r = await fetch('/api/music/top');
+                if (!r.ok) return;
                 const data = await r.json();
                 playlistSongs.value = (data || []).map(s => ({ ...s, filename: s.title || s.filename }));
             }
@@ -7531,6 +7707,15 @@ createApp({
             if (audioEl.value) { audioEl.value.currentTime = time; currentTime.value = time; }
         };
 
+        const handleQueueClickOutside = (e) => {
+            if (!showQueuePanel.value) return;
+            const panel = document.querySelector('.queue-panel');
+            const btn = document.querySelector('[title="Queue"]');
+            if (panel && !panel.contains(e.target) && btn && !btn.contains(e.target)) {
+                showQueuePanel.value = false;
+            }
+        };
+
         onMounted(() => {
             loadFavourites();
 
@@ -7542,19 +7727,15 @@ createApp({
                 fetchArtists();
             }
 
-            // Close queue panel when clicking outside it (but not when clicking the toggle button itself)
-            document.addEventListener('click', (e) => {
-                if (!showQueuePanel.value) return;
-                const panel = document.querySelector('.queue-panel');
-                const btn = document.querySelector('[title="Queue"]');
-                if (panel && !panel.contains(e.target) && btn && !btn.contains(e.target)) {
-                    showQueuePanel.value = false;
-                }
-            });
+            document.addEventListener('click', handleQueueClickOutside);
+        });
+
+        onUnmounted(() => {
+            document.removeEventListener('click', handleQueueClickOutside);
         });
 
         return {
-            tab, artists, albums, genres, songs, searchQuery, onSearch,
+            tab, artists, albums, genres, songs, searchQuery,
             filteredArtists, filteredAlbums, filteredGenres, filteredSongs,
             visibleArtists, visibleAlbums, visibleGenres, visibleSongs,
             showFavsOnly, isFav, toggleFav,
@@ -7718,10 +7899,13 @@ func makeSchemaHandler(database *db.DB) http.HandlerFunc {
         .index-unique { background: #238636; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-left: 8px; }
         .index-sql { font-size: 12px; color: #7ee787; margin-top: 8px; background: #0d1117; padding: 10px; border-radius: 4px; }
         .empty-message { color: #8b949e; font-style: italic; padding: 20px; }
+        .home-link { display: inline-block; margin-bottom: 20px; color: #58a6ff; text-decoration: none; font-size: 14px; }
+        .home-link:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
     <div class="container">
+        <a href="/" class="home-link">← Home</a>
         <h1>&gt; schema_</h1>
         <h2>Tables</h2>
 `)
@@ -8072,10 +8256,16 @@ func processInboxFile(ctx context.Context, fh *multipart.FileHeader, audioDest s
 	}
 	defer src.Close()
 
+	// Sanitise the filename: strip any directory components to prevent path traversal.
+	safeFilename := filepath.Base(fh.Filename)
+	if safeFilename == "." || safeFilename == string(filepath.Separator) {
+		return fmt.Errorf("invalid filename")
+	}
+
 	// Write to a temp file so we can extract metadata
 	tmpDir := filepath.Join(q2Dir, "inbox_tmp")
 	os.MkdirAll(tmpDir, 0755)
-	tmpFile := filepath.Join(tmpDir, fh.Filename)
+	tmpFile := filepath.Join(tmpDir, safeFilename)
 	dst, err := os.Create(tmpFile)
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
@@ -8118,7 +8308,7 @@ func processInboxFile(ctx context.Context, fh *multipart.FileHeader, audioDest s
 		return fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
-	destPath := filepath.Join(destDir, fh.Filename)
+	destPath := filepath.Join(destDir, safeFilename)
 
 	// Check if file already exists
 	if _, err := os.Stat(destPath); err == nil {
@@ -8135,8 +8325,8 @@ func processInboxFile(ctx context.Context, fh *multipart.FileHeader, audioDest s
 	// Update inbox status with destination
 	inboxMu.Lock()
 	for i := range inboxFiles {
-		if inboxFiles[i].Name == fh.Filename && inboxFiles[i].Status == "processing" {
-			inboxFiles[i].Dest = filepath.Join(artist, album, fh.Filename)
+		if inboxFiles[i].Name == safeFilename && inboxFiles[i].Status == "processing" {
+			inboxFiles[i].Dest = filepath.Join(artist, album, safeFilename)
 			break
 		}
 	}
@@ -8760,7 +8950,7 @@ func main() {
 
 		// Playlist API endpoints
 		mux.HandleFunc("/api/playlists", makePlaylistsHandler(playlistDir))
-		mux.HandleFunc("/api/playlist", makePlaylistHandler(playlistDir))
+		mux.HandleFunc("/api/playlist", makePlaylistHandler(playlistDir, database))
 		mux.HandleFunc("/api/playlist/add", makePlaylistAddHandler(playlistDir))
 		mux.HandleFunc("/api/playlist/remove", makePlaylistRemoveHandler(playlistDir))
 		mux.HandleFunc("/api/playlist/reorder", makePlaylistReorderHandler(playlistDir))
@@ -8810,17 +9000,13 @@ func main() {
 		mux.HandleFunc("/api/inbox/status", makeInboxStatusHandler())
 		mux.HandleFunc("/api/inbox/clear", makeInboxClearHandler())
 
-		// Wrapper to set cast manager base URL from first request
+		// Middleware: keep the cast manager's base URL in sync with each request's host.
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if castMgr.IsConnected() || r.URL.Path == "/api/cast/connect" {
-				// Set base URL from the request if not already set
-				scheme := "http"
-				if r.TLS != nil {
-					scheme = "https"
-				}
-				baseURL := fmt.Sprintf("%s://%s", scheme, r.Host)
-				castMgr.SetBaseURL(baseURL)
+			scheme := "http"
+			if r.TLS != nil {
+				scheme = "https"
 			}
+			castMgr.SetBaseURL(fmt.Sprintf("%s://%s", scheme, r.Host))
 			mux.ServeHTTP(w, r)
 		})
 

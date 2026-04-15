@@ -69,52 +69,25 @@ func ExtractAudioMetadata(audioPath string) (*AudioMetadata, error) {
 	return meta, nil
 }
 
-// SaveAudioMetadata saves audio metadata to the database.
+// SaveAudioMetadata saves audio metadata to the database, updating any existing record.
 func SaveAudioMetadata(database *db.DB, fileID int64, meta *AudioMetadata) error {
-	// Check if metadata already exists
-	var existingID int64
-	var existingDuration *int
-	row := database.QueryRow("SELECT id, duration_seconds FROM audio_metadata WHERE file_id = ?", fileID)
-	if err := row.Scan(&existingID, &existingDuration); err == nil {
-		// Already exists - update duration if we now have it but didn't before
-		if existingDuration == nil && meta.DurationSeconds != nil {
-			database.Write("UPDATE audio_metadata SET duration_seconds = ? WHERE id = ?",
-				*meta.DurationSeconds, existingID)
-		}
-		return nil
-	}
-
 	result := database.Write(`
 		INSERT INTO audio_metadata (
 			file_id, artist, album, title, genre,
 			track_number, year, duration_seconds, bitrate
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(file_id) DO UPDATE SET
+			artist          = excluded.artist,
+			album           = excluded.album,
+			title           = excluded.title,
+			genre           = excluded.genre,
+			track_number    = excluded.track_number,
+			year            = excluded.year,
+			duration_seconds = COALESCE(excluded.duration_seconds, duration_seconds),
+			bitrate         = excluded.bitrate
 	`,
 		fileID, meta.Artist, meta.Album, meta.Title, meta.Genre,
 		meta.TrackNumber, meta.Year, meta.DurationSeconds, meta.Bitrate,
 	)
-
 	return result.Err
-}
-
-// HasAudioMetadata checks if a file already has audio metadata.
-func HasAudioMetadata(database *db.DB, fileID int64) bool {
-	var id int64
-	row := database.QueryRow("SELECT id FROM audio_metadata WHERE file_id = ?", fileID)
-	return row.Scan(&id) == nil
-}
-
-// IsSupportedAudioFormat checks if the file extension is a supported audio format.
-func IsSupportedAudioFormat(ext string) bool {
-	ext = strings.ToLower(ext)
-	supported := map[string]bool{
-		".mp3":  true,
-		".m4a":  true,
-		".m4b":  true,
-		".m4p":  true,
-		".flac": true,
-		".ogg":  true,
-		".dsf":  true,
-	}
-	return supported[ext]
 }

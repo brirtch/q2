@@ -197,16 +197,8 @@ func gcdInt64(a, b int64) int64 {
 	return a
 }
 
-// SaveImageMetadata saves image metadata to the database.
+// SaveImageMetadata saves image metadata to the database, updating any existing record.
 func SaveImageMetadata(database *db.DB, fileID int64, meta *ImageMetadata) error {
-	// Check if metadata already exists
-	var existingID int64
-	row := database.QueryRow("SELECT id FROM image_metadata WHERE file_id = ?", fileID)
-	if err := row.Scan(&existingID); err == nil {
-		// Already exists, skip
-		return nil
-	}
-
 	result := database.Write(`
 		INSERT INTO image_metadata (
 			file_id, camera_make, camera_model, date_taken,
@@ -214,19 +206,24 @@ func SaveImageMetadata(database *db.DB, fileID int64, meta *ImageMetadata) error
 			exposure_time, f_number, focal_length,
 			gps_latitude, gps_longitude
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(file_id) DO UPDATE SET
+			camera_make   = excluded.camera_make,
+			camera_model  = excluded.camera_model,
+			date_taken    = excluded.date_taken,
+			width         = excluded.width,
+			height        = excluded.height,
+			orientation   = excluded.orientation,
+			iso           = excluded.iso,
+			exposure_time = excluded.exposure_time,
+			f_number      = excluded.f_number,
+			focal_length  = excluded.focal_length,
+			gps_latitude  = excluded.gps_latitude,
+			gps_longitude = excluded.gps_longitude
 	`,
 		fileID, meta.CameraMake, meta.CameraModel, meta.DateTaken,
 		meta.Width, meta.Height, meta.Orientation, meta.ISO,
 		meta.ExposureTime, meta.FNumber, meta.FocalLength,
 		meta.GPSLatitude, meta.GPSLongitude,
 	)
-
 	return result.Err
-}
-
-// HasImageMetadata checks if a file already has image metadata.
-func HasImageMetadata(database *db.DB, fileID int64) bool {
-	var id int64
-	row := database.QueryRow("SELECT id FROM image_metadata WHERE file_id = ?", fileID)
-	return row.Scan(&id) == nil
 }

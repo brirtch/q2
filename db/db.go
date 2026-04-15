@@ -12,11 +12,20 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// Statement is a single SQL statement used in a transaction.
+type Statement struct {
+	Query string
+	Args  []interface{}
+}
+
 // WriteRequest represents a write operation to be executed by the writer goroutine.
 type WriteRequest struct {
 	Query  string
 	Args   []any
 	Result chan WriteResult
+	// Tx, if non-nil, means run all TxStatements in a single transaction.
+	Tx         []Statement
+	TxResult   chan error
 }
 
 // WriteResult contains the result of a write operation.
@@ -87,24 +96,46 @@ func Open(dbPath string) (*DB, error) {
 func (db *DB) writerLoop() {
 	defer db.wg.Done()
 
+	process := func(req WriteRequest) {
+		if req.TxResult != nil {
+			req.TxResult <- db.executeTransaction(req.Tx)
+			return
+		}
+		result := db.executeWrite(req.Query, req.Args)
+		req.Result <- result
+	}
+
 	for {
 		select {
 		case req := <-db.writeChan:
-			result := db.executeWrite(req.Query, req.Args)
-			req.Result <- result
+			process(req)
 		case <-db.done:
 			// Drain remaining requests before shutting down
 			for {
 				select {
 				case req := <-db.writeChan:
-					result := db.executeWrite(req.Query, req.Args)
-					req.Result <- result
+					process(req)
 				default:
 					return
 				}
 			}
 		}
 	}
+}
+
+// executeTransaction runs multiple statements in a single SQLite transaction.
+func (db *DB) executeTransaction(stmts []Statement) error {
+	tx, err := db.writeConn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	for _, s := range stmts {
+		if _, err := tx.Exec(s.Query, s.Args...); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // executeWrite performs the actual write operation.
@@ -121,6 +152,17 @@ func (db *DB) executeWrite(query string, args []any) WriteResult {
 		LastInsertID: lastID,
 		RowsAffected: rowsAffected,
 	}
+}
+
+// WriteTransaction executes multiple statements atomically in a single transaction.
+// Runs on the writer goroutine to maintain the Single Writer guarantee.
+func (db *DB) WriteTransaction(stmts []Statement) error {
+	req := WriteRequest{
+		Tx:       stmts,
+		TxResult: make(chan error, 1),
+	}
+	db.writeChan <- req
+	return <-req.TxResult
 }
 
 // Write sends a write request to the writer goroutine and waits for the result.

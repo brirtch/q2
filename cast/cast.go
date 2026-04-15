@@ -467,8 +467,6 @@ func (m *Manager) PlayMedia(filePath, contentType, title string) (string, error)
 		mediaURL = fmt.Sprintf("%s/api/stream?path=%s", m.baseURL, encodedPath)
 	}
 
-	fmt.Printf("Casting to %s: %s (%s)\n", m.connectedTo.Name, mediaURL, contentType)
-
 	// Store app reference before releasing lock
 	app := m.app
 
@@ -493,22 +491,6 @@ func (m *Manager) PlayMedia(filePath, contentType, title string) (string, error)
 	}
 
 	return mediaURL, nil
-}
-
-// PlayURL plays a direct URL on the connected device.
-func (m *Manager) PlayURL(mediaURL, contentType string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.app == nil {
-		return fmt.Errorf("not connected to any device")
-	}
-
-	if err := m.app.Load(mediaURL, 0, contentType, false, true, true); err != nil {
-		return fmt.Errorf("failed to load media: %w", err)
-	}
-
-	return nil
 }
 
 // Pause pauses the current playback.
@@ -610,14 +592,12 @@ func (m *Manager) GetStatus() Status {
 
 	// Force status update from device
 	if err := app.Update(); err != nil {
-		fmt.Printf("Cast update error: %v\n", err)
+		_ = err // update errors are non-fatal; status will be stale
 	}
 
 	// Get cast status
 	castStatus, media, volume := app.Status()
-
-	// Debug: log what we're getting
-	fmt.Printf("Cast status - castStatus: %v, media: %v, volume: %v\n", castStatus != nil, media != nil, volume != nil)
+	_ = castStatus
 
 	// Get volume info
 	if volume != nil {
@@ -631,7 +611,6 @@ func (m *Manager) GetStatus() Status {
 		status.CurrentTime = float64(media.CurrentTime)
 		status.Duration = float64(media.Media.Duration)
 		status.MediaURL = media.Media.ContentId
-		fmt.Printf("Media status - state: %s, time: %.1f, duration: %.1f\n", media.PlayerState, media.CurrentTime, media.Media.Duration)
 	}
 
 	return status
